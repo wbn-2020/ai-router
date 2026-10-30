@@ -107,6 +107,10 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "gateway: 初始化 HTTP 服务失败：%v\n", err)
 		return 1
 	}
+	if err := mountDataPlane(cfg, st, srv); err != nil {
+		fmt.Fprintf(stderr, "gateway: 初始化数据面失败：%v\n", err)
+		return 1
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
