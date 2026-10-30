@@ -71,9 +71,10 @@ func mountDataPlane(cfg config.Config, st *store.Store, srv *server.Server) erro
 		return fmt.Errorf("初始化非流式代理：%w", err)
 	}
 	router, err := gateway.New(gateway.Options{
-		ClientKey: cfg.ClientKey,
-		Routes:    routes,
-		Forwarder: proxy,
+		ClientKey:          cfg.ClientKey,
+		Routes:             routes,
+		Forwarder:          proxy,
+		CodexContextWindow: cfg.CodexContextWindow,
 	})
 	if err != nil {
 		return fmt.Errorf("初始化客户端路由：%w", err)

@@ -94,6 +94,10 @@ type Options struct {
 	// Forwarder 接收已鉴权且存在同协议候选的请求；为 nil 时返回 503。
 	// T20/T21 的代理与流式编排通过该 seam 接入。
 	Forwarder http.Handler
+	// CodexContextWindow 覆盖 Codex manifest 的 context_window 与
+	// max_context_window。<=0 时回退到 GATEWAY_CODEX_CONTEXT_WINDOW，
+	// 再回退到默认值 128000。
+	CodexContextWindow int
 }
 
 // Handler 是客户端数据面的 http.Handler。
@@ -116,7 +120,7 @@ func New(opts Options) (*Handler, error) {
 		auth:          newClientKeyAuth(opts.ClientKey),
 		routes:        opts.Routes,
 		forwarder:     opts.Forwarder,
-		codexManifest: buildCodexManifestPlaceholder,
+		codexManifest: newCodexManifestBuilder(opts.CodexContextWindow),
 	}, nil
 }
 

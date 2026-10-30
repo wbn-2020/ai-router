@@ -8,6 +8,7 @@ import {
 } from 'react';
 
 import { ApiError, apiRequest, isUnauthorizedError } from '../../lib/api';
+import { CaptureDialog } from './CaptureDialog';
 
 /**
  * 请求详情抽屉（T16）。
@@ -17,7 +18,8 @@ import { ApiError, apiRequest, isUnauthorizedError } from '../../lib/api';
  * - 不展示 header、body 或 prompt：这些字段根本不在视图模型里；
  * - usage 缺失时显示 “—”，不把未知值伪装成 0；
  * - 每次 attempt 的渠道、状态、延迟与错误都可见；
- * - body 捕获入口属于 T25；这里只说明默认未捕获与诊断环提示。
+ * - body 捕获入口由 T25 的 CaptureDialog 提供：默认只展示元数据；只有
+ *   管理员打开捕获面板并确认风险后才保存/读取 body。
  */
 
 /**
@@ -457,7 +459,7 @@ function AttemptsPanel({ attempts }: { attempts: RequestAttemptView[] }) {
   );
 }
 
-function CaptureHintPanel() {
+function CaptureSection({ onOpen }: { onOpen: () => void }): ReactNode {
   return (
     <section className="panel" aria-labelledby="request-detail-capture">
       <div className="panel-header">
@@ -468,8 +470,11 @@ function CaptureHintPanel() {
         <p>默认只保存请求元数据，不保存 header、body 或 prompt。</p>
         <p className="muted">
           只有内存诊断环仍可用的请求才能按需抓取 body；保存需要管理员显式确认风险，内容使用
-          AES-GCM 加密并在 24 小时后自动删除。本页当前只展示元数据。
+          AES-GCM 加密并在 24 小时后自动删除。
         </p>
+        <button type="button" className="button button--ghost" onClick={onOpen}>
+          打开 Body 捕获面板
+        </button>
       </div>
     </section>
   );
@@ -511,6 +516,7 @@ const DRAWER_BODY_STYLE: CSSProperties = {
 export function RequestDetail({ requestID, onClose }: RequestDetailProps): ReactNode {
   const [state, setState] = useState<DetailState>({ status: 'loading' });
   const [reloadKey, setReloadKey] = useState(0);
+  const [captureOpen, setCaptureOpen] = useState(false);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const sequence = useRef(0);
 
@@ -560,6 +566,10 @@ export function RequestDetail({ requestID, onClose }: RequestDetailProps): React
   }, []);
 
   useEffect(() => {
+    // 捕获对话框打开时，Escape 只关闭该对话框；否则一次按键会连详情抽屉一起关闭。
+    if (captureOpen) {
+      return;
+    }
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         onClose();
@@ -569,7 +579,7 @@ export function RequestDetail({ requestID, onClose }: RequestDetailProps): React
     return () => {
       document.removeEventListener('keydown', handleKeyDown);
     };
-  }, [onClose]);
+  }, [captureOpen, onClose]);
 
   return (
     <div
@@ -636,11 +646,24 @@ export function RequestDetail({ requestID, onClose }: RequestDetailProps): React
               <MetadataPanel request={state.detail.request} />
               <UsagePanel request={state.detail.request} />
               <AttemptsPanel attempts={state.detail.attempts ?? []} />
-              <CaptureHintPanel />
+              <CaptureSection
+                onOpen={() => {
+                  setCaptureOpen(true);
+                }}
+              />
             </>
           )}
         </div>
       </section>
+
+      {captureOpen && state.status === 'ready' ? (
+        <CaptureDialog
+          requestID={state.detail.request.request_id}
+          onClose={() => {
+            setCaptureOpen(false);
+          }}
+        />
+      ) : null}
     </div>
   );
 }

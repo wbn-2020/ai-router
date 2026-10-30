@@ -1,0 +1,23 @@
+# 构建上下文只保留构建所需文件，避免把本机数据、秘密和参考仓库带进镜像。
+.git
+.gitignore
+.zcode
+reference
+data
+docs
+e2e
+
+# 本机残留的嵌入产物必须由 web 阶段的 npm run build 重新生成。
+internal/webassets/dist
+
+web/node_modules
+web/dist
+web/coverage
+
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+.env
+.env.*
