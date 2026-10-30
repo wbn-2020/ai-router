@@ -1,0 +1,41 @@
+{
+  "name": "ai-router-admin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AI Router 单管理员管理端",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:app": "vitest run src/app/App.test.tsx",
+    "test:settings": "vitest run src/features/settings/SettingsPage.test.tsx",
+    "test:channels": "vitest run src/features/channels/ChannelsPage.test.tsx",
+    "test:mappings": "vitest run src/features/mappings/MappingsPage.test.tsx",
+    "test:dashboard": "vitest run src/features/dashboard/DashboardPage.test.tsx",
+    "test:requests": "vitest run src/features/requests/RequestsPage.test.tsx",
+    "test:capture": "vitest run src/features/requests/CaptureDialog.test.tsx",
+    "test:debug": "node scripts/test-debug.mjs"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "5.101.2",
+    "@tanstack/react-router": "1.170.17",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
+  },
+  "devDependencies": {
+    "@testing-library/dom": "10.4.1",
+    "@testing-library/jest-dom": "6.6.3",
+    "@testing-library/react": "16.3.3",
+    "@testing-library/user-event": "14.6.1",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.7",
+    "@vitejs/plugin-react": "4.7.0",
+    "jsdom": "25.0.1",
+    "typescript": "5.6.3",
+    "vite": "5.4.21",
+    "vitest": "2.1.9"
+  }
+}
