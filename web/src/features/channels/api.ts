@@ -13,8 +13,10 @@ import type {
   Channel,
   ChannelInput,
   ChannelListResponse,
+  ChannelModelsResponse,
   ChannelPatch,
   ChannelTestResult,
+  PreviewChannelModelsInput,
   RevealedChannelKey,
 } from './types';
 
@@ -47,6 +49,22 @@ export const channelsApi = {
   revealKey(id: number): Promise<RevealedChannelKey> {
     return apiRequest<RevealedChannelKey>(
       `/admin/api/channels/${encodeURIComponent(String(id))}/key`,
+    );
+  },
+
+  /** previewModels 用未保存的 Base URL/Key 拉取上游模型列表。 */
+  previewModels(input: PreviewChannelModelsInput): Promise<ChannelModelsResponse> {
+    return apiRequest<ChannelModelsResponse>('/admin/api/channels/preview-models', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    });
+  },
+
+  /** syncModels 用已保存渠道的加密 Key 拉取模型列表，不自动落库。 */
+  syncModels(id: number): Promise<ChannelModelsResponse> {
+    return apiRequest<ChannelModelsResponse>(
+      `/admin/api/channels/${encodeURIComponent(String(id))}/models/sync`,
+      { method: 'POST' },
     );
   },
 

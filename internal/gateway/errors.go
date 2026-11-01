@@ -91,6 +91,14 @@ func writeMissingModel(w http.ResponseWriter) {
 	})
 }
 
+func writeModelTooLong(w http.ResponseWriter) {
+	writeAPIError(w, http.StatusBadRequest, APIError{
+		Message: "The 'model' field is too long.",
+		Type:    errorTypeInvalidRequest,
+		Code:    errorCodeInvalidRequest,
+	})
+}
+
 func writeBodyTooLarge(w http.ResponseWriter) {
 	writeAPIError(w, http.StatusRequestEntityTooLarge, APIError{
 		Message: "Request body is too large.",

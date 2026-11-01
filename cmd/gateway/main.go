@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"ai-router/internal/config"
-	"ai-router/internal/server"
+	"ai-router/internal/observability"
 	"ai-router/internal/store"
 )
 
@@ -98,22 +98,25 @@ func runServe(args []string, _ io.Writer, stderr io.Writer) int {
 		return 1
 	}
 
-	srv, err := server.New(server.Options{
-		ListenAddr:      cfg.ListenAddr,
-		Store:           st,
-		MasterKeyLoaded: len(cfg.MasterKey) == 32,
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// 诊断环必须在任何请求进入前按配置重建；管理 API 与数据面共享同一实例。
+	observability.ConfigureDefaultCaptureRing(observability.CaptureRingOptions{
+		BodyLimit: cfg.CaptureMaxBytes,
 	})
+
+	srv, plane, err := buildServer(cfg, st)
 	if err != nil {
-		fmt.Fprintf(stderr, "gateway: 初始化 HTTP 服务失败：%v\n", err)
-		return 1
-	}
-	if err := mountDataPlane(cfg, st, srv); err != nil {
-		fmt.Fprintf(stderr, "gateway: 初始化数据面失败：%v\n", err)
+		fmt.Fprintf(stderr, "gateway: 初始化服务失败：%v\n", err)
 		return 1
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// 请求日志保留清理在后台按天运行；首次启动立即清理一次。错误只影响
+	// 日志表体积，不阻断数据面。
+	go plane.Journal().RunRetention(ctx, 0, 0, func(err error) {
+		fmt.Fprintf(stderr, "gateway: 清理过期请求日志失败：%v\n", err)
+	})
 
 	fmt.Fprintf(stderr, "gateway: 监听 %s\n", srv.Addr())
 	if err := srv.Run(ctx); err != nil {

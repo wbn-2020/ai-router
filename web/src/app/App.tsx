@@ -22,6 +22,15 @@ import {
   type ReactNode,
 } from 'react';
 
+import {
+  THEME_STORAGE_KEY,
+  applyTheme,
+  isThemePreference,
+  readThemePreference,
+  saveThemePreference,
+  type ThemePreference,
+} from '../lib/theme';
+
 /* -------------------------------------------------------------------------- */
 /* 管理 API 客户端                                                             */
 /* -------------------------------------------------------------------------- */
@@ -298,6 +307,100 @@ function useToast(): ToastApi {
 }
 
 /* -------------------------------------------------------------------------- */
+/* 外观                                                                        */
+/* -------------------------------------------------------------------------- */
+
+interface ThemeContextValue {
+  preference: ThemePreference;
+  setPreference: (value: ThemePreference) => void;
+}
+
+const ThemeContext = createContext<ThemeContextValue | null>(null);
+
+function ThemeProvider({ children }: { children: ReactNode }) {
+  const [preference, setPreference] = useState<ThemePreference>(readThemePreference);
+
+  useEffect(() => {
+    const updateSystemTheme = () => {
+      applyTheme(preference);
+    };
+    updateSystemTheme();
+    const media =
+      typeof window.matchMedia === 'function'
+        ? window.matchMedia('(prefers-color-scheme: dark)')
+        : null;
+    if (preference === 'system') {
+      media?.addEventListener('change', updateSystemTheme);
+    }
+    return () => {
+      media?.removeEventListener('change', updateSystemTheme);
+    };
+  }, [preference]);
+
+  useEffect(() => {
+    const syncPreference = (event: StorageEvent) => {
+      if (event.key === THEME_STORAGE_KEY || event.key === null) {
+        setPreference(readThemePreference());
+      }
+    };
+    window.addEventListener('storage', syncPreference);
+    return () => {
+      window.removeEventListener('storage', syncPreference);
+    };
+  }, []);
+
+  const changePreference = (value: ThemePreference) => {
+    applyTheme(value);
+    saveThemePreference(value);
+    setPreference(value);
+  };
+
+  return (
+    <ThemeContext.Provider value={{ preference, setPreference: changePreference }}>
+      {children}
+    </ThemeContext.Provider>
+  );
+}
+
+function ThemeControl() {
+  const theme = useContext(ThemeContext);
+  if (theme === null) {
+    throw new Error('ThemeControl 必须在 ThemeProvider 内使用');
+  }
+  return (
+    <label className="theme-control">
+      <svg
+        viewBox="0 0 24 24"
+        width="17"
+        height="17"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.7"
+        aria-hidden="true"
+        focusable="false"
+      >
+        <circle cx="12" cy="12" r="4" />
+        <path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5 19 19M5 19l1.5-1.5M17.5 6.5 19 5" />
+      </svg>
+      <span className="sr-only">外观主题</span>
+      <select
+        aria-label="外观主题"
+        value={theme.preference}
+        onChange={(event) => {
+          if (isThemePreference(event.target.value)) {
+            theme.setPreference(event.target.value);
+          }
+        }}
+      >
+        <option value="system">跟随系统</option>
+        <option value="light">浅色</option>
+        <option value="dark">深色</option>
+      </select>
+    </label>
+  );
+}
+
+/* -------------------------------------------------------------------------- */
 /* 导航图标                                                                    */
 /* -------------------------------------------------------------------------- */
 
@@ -506,6 +609,7 @@ function LoginPage() {
 
   return (
     <main className="login-page">
+      <div className="login-theme"><ThemeControl /></div>
       <section className="login-panel" aria-labelledby="login-title">
         <div className="brand brand--login">
           <span className="brand-mark" aria-hidden="true">
@@ -600,7 +704,7 @@ function LoginPage() {
 const NAV_ITEMS = [
   { to: '/', label: '总览', icon: 'dashboard' },
   { to: '/channels', label: '渠道', icon: 'channels' },
-  { to: '/mappings', label: '模型映射', icon: 'mappings' },
+  { to: '/mappings', label: '模型路由', icon: 'mappings' },
   { to: '/requests', label: '请求', icon: 'requests' },
   { to: '/debug', label: '调试', icon: 'debug' },
   { to: '/settings', label: '设置', icon: 'settings' },
@@ -608,7 +712,7 @@ const NAV_ITEMS = [
 
 const SECTION_TITLES = [
   ['/channels', '渠道'],
-  ['/mappings', '模型映射'],
+  ['/mappings', '模型路由'],
   ['/requests', '请求观测'],
   ['/debug', '调试'],
   ['/settings', '设置'],
@@ -727,6 +831,7 @@ function AdminLayout() {
           </div>
 
           <div className="topbar-actions">
+            <ThemeControl />
             <span className="admin-chip">
               <span className="status-dot" aria-hidden="true" />
               管理员
@@ -840,7 +945,7 @@ function MappingsSkeleton() {
     <>
       <PageHeader
         title="模型映射"
-        description="客户端模型到渠道与上游模型的显式映射，是唯一的路由来源。"
+        description="正常添加渠道时会自动生成；这里只处理别名与多渠道分流。"
       />
 
       <section className="panel">
@@ -1136,12 +1241,14 @@ export function App() {
   const [router] = useState(() => createAppRouter(auth));
 
   return (
-    <AuthContext.Provider value={auth}>
-      <QueryClientProvider client={queryClient}>
-        <ToastProvider>
-          <RouterProvider router={router} />
-        </ToastProvider>
-      </QueryClientProvider>
-    </AuthContext.Provider>
+    <ThemeProvider>
+      <AuthContext.Provider value={auth}>
+        <QueryClientProvider client={queryClient}>
+          <ToastProvider>
+            <RouterProvider router={router} />
+          </ToastProvider>
+        </QueryClientProvider>
+      </AuthContext.Provider>
+    </ThemeProvider>
   );
 }

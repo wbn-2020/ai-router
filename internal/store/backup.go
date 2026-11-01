@@ -146,6 +146,12 @@ func Restore(ctx context.Context, paths Paths, backupPath string) (RestoreResult
 		return result, fmt.Errorf("store: 检查当前数据库失败：%w", statErr)
 	}
 
+	// 复制前先把旧库 WAL 合并回主文件。这样即使后续替换失败，旧库仍是
+	// 完整可打开的；否则先删 WAL 再 rename 失败会丢掉尚未 checkpoint 的提交。
+	if err := checkpointCurrentForRestore(ctx, paths); err != nil {
+		return result, err
+	}
+
 	tempPath, err := copyToTemp(filepath.Dir(paths.DBPath), sourcePath)
 	if err != nil {
 		return result, err
@@ -168,6 +174,33 @@ func Restore(ctx context.Context, paths Paths, backupPath string) (RestoreResult
 		return result, fmt.Errorf("store: 替换数据库失败：%w", err)
 	}
 	return result, nil
+}
+
+func checkpointCurrentForRestore(ctx context.Context, paths Paths) error {
+	if _, err := os.Stat(paths.DBPath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("store: 检查当前数据库失败：%w", err)
+	}
+
+	live, err := Open(paths)
+	if err != nil {
+		return fmt.Errorf("store: 打开当前数据库失败，当前库未改动：%w", err)
+	}
+	var busy, logFrames, checkpointed int
+	scanErr := live.db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).
+		Scan(&busy, &logFrames, &checkpointed)
+	closeErr := live.Close()
+	if scanErr != nil {
+		return fmt.Errorf("store: 旧库 WAL checkpoint 失败，当前库未改动：%w", scanErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("store: 关闭当前数据库失败：%w", closeErr)
+	}
+	if busy != 0 {
+		return errors.New("store: 旧库 WAL 仍被占用，请先停止 gateway 进程再恢复")
+	}
+	return nil
 }
 
 func backupCurrentForRestore(ctx context.Context, paths Paths) (string, error) {
@@ -255,6 +288,21 @@ func inspectBackup(ctx context.Context, backupPath string) (backupInfo, error) {
 		return backupInfo{}, fmt.Errorf(
 			"store: 备份 schema 版本 v%d 高于当前程序支持的 v%d，拒绝恢复", version, maxVersion,
 		)
+	}
+	applied, _, err := readAppliedMigrations(ctx, db)
+	if err != nil {
+		return backupInfo{}, err
+	}
+	if _, err := validateMigrationHistory(applied, migrations); err != nil {
+		return backupInfo{}, fmt.Errorf("store: 备份迁移记录不兼容：%w", err)
+	}
+	rows, err := db.QueryContext(ctx, `PRAGMA foreign_key_check`)
+	if err != nil {
+		return backupInfo{}, errors.New("store: 备份外键校验失败")
+	}
+	defer rows.Close()
+	if rows.Next() || rows.Err() != nil {
+		return backupInfo{}, errors.New("store: 备份外键校验失败")
 	}
 	return backupInfo{Version: version, Size: stat.Size()}, nil
 }

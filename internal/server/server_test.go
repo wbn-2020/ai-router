@@ -568,3 +568,36 @@ func TestEmbeddedAssets(t *testing.T) {
 		t.Error("webassets.Index 与 dist/index.html 内容不一致")
 	}
 }
+
+func TestThemeInitializationAsset(t *testing.T) {
+	index, err := webassets.Index()
+	if err != nil {
+		t.Fatalf("webassets.Index: %v", err)
+	}
+	if !bytes.Contains(index, []byte(`src="/assets/theme-init.js"`)) {
+		t.Fatal("管理端缺少同源主题初始化脚本")
+	}
+	themeOffset := bytes.Index(index, []byte("/assets/theme-init.js"))
+	appOffset := bytes.Index(index, []byte(`type="module"`))
+	if appOffset < 0 || themeOffset > appOffset {
+		t.Fatal("主题脚本必须先于应用模块加载")
+	}
+	s := newTestServer(t, server.Options{})
+	page := serveRequest(s.Handler(), http.MethodGet, "/admin/", nil)
+	csp := page.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "script-src 'self';") {
+		t.Errorf("管理页脚本策略不再限制同源：%s", csp)
+	}
+	for _, path := range []string{"/assets/theme-init.js", "/admin/assets/theme-init.js"} {
+		rec := serveRequest(s.Handler(), http.MethodGet, path, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d, want 200", path, rec.Code)
+		}
+		if !strings.Contains(rec.Header().Get("Content-Type"), "javascript") {
+			t.Errorf("GET %s 未以 JavaScript 类型返回", path)
+		}
+		if !strings.Contains(rec.Body.String(), "ai-router.theme") {
+			t.Errorf("GET %s 缺少主题初始化内容", path)
+		}
+	}
+}

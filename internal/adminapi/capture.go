@@ -262,8 +262,10 @@ func (a *API) handleCaptureDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// captureDependencies 从管理 API 已持有的数据库连接构造捕获仓储，并解析
-// GATEWAY_MASTER_KEY。主密钥缺失时返回 503，与渠道管理端点的行为一致。
+// captureDependencies 从管理 API 已持有的数据库连接构造捕获仓储。
+//
+// 生产路径使用 server.Options.MasterKey 构造的信封；未注入时回退环境变量，
+// 兼容直接构造 adminapi 的测试/嵌入场景。主密钥缺失时返回 503。
 func (a *API) captureDependencies(w http.ResponseWriter) (*observability.CaptureStore, bool) {
 	if a.db == nil {
 		writeError(w, http.StatusServiceUnavailable, "capture_unavailable",
@@ -276,14 +278,20 @@ func (a *API) captureDependencies(w http.ResponseWriter) (*observability.Capture
 			"请求捕获暂不可用：数据库未就绪")
 		return nil, false
 	}
-	envelope, err := channelMasterEnvelope()
-	if err != nil {
-		a.logger.Error("请求捕获需要主密钥，但 GATEWAY_MASTER_KEY 不可用")
-		writeError(w, http.StatusServiceUnavailable, "capture_unavailable",
-			"请求捕获暂不可用：主密钥未就绪")
-		return nil, false
+	envelope := a.envelope
+	if envelope == nil {
+		var err error
+		envelope, err = channelMasterEnvelope()
+		if err != nil {
+			a.logger.Error("请求捕获需要主密钥，但 GATEWAY_MASTER_KEY 不可用")
+			writeError(w, http.StatusServiceUnavailable, "capture_unavailable",
+				"请求捕获暂不可用：主密钥未就绪")
+			return nil, false
+		}
 	}
-	return observability.NewCaptureStore(db, envelope, observability.CaptureStoreOptions{}), true
+	return observability.NewCaptureStore(db, envelope, observability.CaptureStoreOptions{
+		BodyLimit: a.captureMaxBytes,
+	}), true
 }
 
 func (a *API) writeCaptureError(w http.ResponseWriter, err error) {

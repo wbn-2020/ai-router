@@ -21,3 +21,4 @@ web/coverage
 
 .env
 .env.*
+gateway.env

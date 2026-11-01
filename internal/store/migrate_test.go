@@ -158,8 +158,17 @@ func TestMigrateFreshAndIdempotent(t *testing.T) {
 	if result.ToVersion != wantVersion {
 		t.Fatalf("新库 ToVersion = %d，期望 %d", result.ToVersion, wantVersion)
 	}
-	if len(result.Applied) != 1 || result.Applied[0] != wantVersion {
-		t.Fatalf("新库 Applied = %v，期望 [%d]", result.Applied, wantVersion)
+	migrations, err := EmbeddedMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Applied) != len(migrations) {
+		t.Fatalf("新库 Applied = %v，期望 %d 个迁移", result.Applied, len(migrations))
+	}
+	for i, migration := range migrations {
+		if result.Applied[i] != migration.Version {
+			t.Fatalf("新库 Applied = %v，迁移顺序不符", result.Applied)
+		}
 	}
 	if result.BackupPath == "" {
 		t.Fatal("有待应用迁移时应生成迁移前备份")
@@ -788,7 +797,7 @@ func TestRestoreRejectsInvalidBackup(t *testing.T) {
 			t.Fatalf("future Migrate: %v", err)
 		}
 		if _, err := source.DB().Exec(
-			`UPDATE schema_migrations SET version = ?`, liveVersion+100,
+			`UPDATE schema_migrations SET version = ? WHERE version = ?`, liveVersion+100, liveVersion,
 		); err != nil {
 			t.Fatalf("抬高版本: %v", err)
 		}
@@ -931,6 +940,84 @@ func TestChannelsNameUniqueConstraint(t *testing.T) {
 	}
 	if id != firstID || name != "unique-name" {
 		t.Fatalf("原记录被修改：id=%d name=%q", id, name)
+	}
+}
+
+func TestRestoreRejectsIncompatibleHistoryAndForeignKeys(t *testing.T) {
+	for _, test := range []struct{ name, query string }{
+		{"checksum", `UPDATE schema_migrations SET checksum = 'wrong' WHERE version = 1`},
+		{"name", `UPDATE schema_migrations SET name = 'wrong' WHERE version = 1`},
+		{"history_gap", `DELETE FROM schema_migrations WHERE version = 1`},
+		{"foreign_key", `INSERT INTO model_routes (client_model, channel_id, upstream_model, created_at, updated_at) VALUES ('orphan', 99999, 'orphan', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			paths := newTestPaths(t)
+			live, result := openMigratedStore(t, paths)
+			insertChannel(t, live.DB(), "keep-me")
+			if err := live.Close(); err != nil {
+				t.Fatal(err)
+			}
+			source, _ := openMigratedStore(t, newTestPaths(t))
+			mustExec(t, source.DB(), `PRAGMA foreign_keys = OFF`)
+			mustExec(t, source.DB(), test.query)
+			if test.name != "foreign_key" {
+				if _, err := source.Migrate(ctx); err == nil {
+					t.Fatal("startup accepted incompatible migration history")
+				}
+			}
+			backupPath := source.DBPath()
+			if err := source.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Restore(ctx, paths, backupPath); err == nil {
+				t.Fatal("invalid backup accepted")
+			}
+			assertLiveChannel(t, paths, "keep-me", result.ToVersion)
+			entries, err := os.ReadDir(paths.BackupsDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), "pre-restore-") {
+					t.Fatal("preflight failure created a pre-restore backup")
+				}
+			}
+		})
+	}
+}
+
+func TestChannelRevisionMigrationPreservesExistingData(t *testing.T) {
+	ctx := context.Background()
+	migrations, err := EmbeddedMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migrations) < 2 {
+		t.Fatal("missing channel revision migration")
+	}
+	s, err := Open(newTestPaths(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	if _, err := s.MigrateWith(ctx, migrations[:1]); err != nil {
+		t.Fatal(err)
+	}
+	id := insertChannel(t, s.DB(), "legacy")
+	mustExec(t, s.DB(), `UPDATE channels SET last_health_status = 'healthy', last_health_at = '2026-01-01T00:00:00Z' WHERE id = ?`, id)
+	if _, err := s.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	channel, err := s.Channels().Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if channel.ConnectionRevision != 1 || channel.Name != "legacy" || channel.KeyCiphertext != "v1:test-ciphertext" {
+		t.Fatalf("migration lost configuration: %+v", channel)
+	}
+	if channel.LastHealthRevision != 0 || channel.LastHealthStatus != "" || channel.LastHealthAt != nil {
+		t.Fatalf("unversioned legacy health should be invalidated: %+v", channel)
 	}
 }
 

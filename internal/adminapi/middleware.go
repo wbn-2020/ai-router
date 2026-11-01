@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -21,6 +22,11 @@ import (
 	"time"
 
 	"ai-router/internal/adminauth"
+	"ai-router/internal/config"
+	"ai-router/internal/routing"
+	"ai-router/internal/secret"
+	"ai-router/internal/store"
+	"ai-router/internal/upstream"
 )
 
 const (
@@ -40,21 +46,52 @@ type Options struct {
 	// DB 用于记录和展示 admin_sessions.last_seen_at；nil 时跳过该功能。
 	// 应与 Auth 使用同一个数据库。
 	DB adminauth.DB
+	// Envelope 是启动时从 config.MasterKey 构造的密钥信封；nil 时回退读取
+	// GATEWAY_MASTER_KEY，兼容直接构造 adminapi 的测试/嵌入场景。
+	Envelope *secret.Envelope
 	// CookieSecure 控制 session cookie 的 Secure 标志；HTTPS 部署必须为 true。
 	CookieSecure bool
+	// CaptureMaxBytes 是单侧请求/响应 body 捕获上限；<= 0 时使用默认 8 MiB。
+	CaptureMaxBytes int64
+	// Models 用于上游模型发现；nil 时复用 ProbeClient。
+	Models ModelLister
+	// ProbeClient 由生产入口注入共享上游客户端；nil 仅为直接嵌入提供默认客户端。
+	ProbeClient *upstream.Client
+	// ProbeTimeout 和 ModelDiscoveryTimeout 限制各检查的总预算。
+	ProbeTimeout          time.Duration
+	ModelDiscoveryTimeout time.Duration
+	// Runtime 只读运行状态；nil 时返回 unknown。
+	Runtime RuntimeReader
 	// Logger 为 nil 时使用 slog.Default()。
 	Logger *slog.Logger
+}
+
+// ModelLister 是模型发现需要的最小上游能力；upstream.Client 满足该接口。
+type ModelLister interface {
+	ListModels(ctx context.Context, target upstream.Target) ([]string, error)
+}
+
+// RuntimeReader 提供无调度副作用的渠道运行快照。
+type RuntimeReader interface {
+	Runtime(channel store.Channel) routing.RuntimeSnapshot
 }
 
 // API 是管理端 REST API 的 http.Handler。
 //
 // API 在构造后不可变，可被并发使用；后续任务通过同包文件注册更多路由。
 type API struct {
-	auth         *adminauth.Manager
-	db           adminauth.DB
-	cookieSecure bool
-	logger       *slog.Logger
-	mux          *http.ServeMux
+	auth                  *adminauth.Manager
+	db                    adminauth.DB
+	envelope              *secret.Envelope
+	cookieSecure          bool
+	captureMaxBytes       int64
+	models                ModelLister
+	probeClient           *upstream.Client
+	probeTimeout          time.Duration
+	modelDiscoveryTimeout time.Duration
+	runtime               RuntimeReader
+	logger                *slog.Logger
+	mux                   *http.ServeMux
 }
 
 // New 构造管理 API；不会执行数据库迁移或创建管理员。
@@ -65,13 +102,42 @@ func New(opts Options) (*API, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+	if opts.ProbeTimeout < 0 || opts.ModelDiscoveryTimeout < 0 {
+		return nil, errors.New("adminapi: 检查预算不能为负")
+	}
+	if opts.ProbeTimeout == 0 {
+		opts.ProbeTimeout = config.DefaultProbeTimeout
+	}
+	if opts.ModelDiscoveryTimeout == 0 {
+		opts.ModelDiscoveryTimeout = config.DefaultModelDiscoveryTimeout
+	}
+	if opts.ProbeClient == nil {
+		opts.ProbeClient, _ = opts.Models.(*upstream.Client)
+	}
+	if opts.ProbeClient == nil {
+		client, err := upstream.NewClient(upstream.DefaultOptions())
+		if err != nil {
+			return nil, fmt.Errorf("adminapi: 初始化默认上游客户端失败：%w", err)
+		}
+		opts.ProbeClient = client
+	}
+	if opts.Models == nil {
+		opts.Models = opts.ProbeClient
+	}
 
 	a := &API{
-		auth:         opts.Auth,
-		db:           opts.DB,
-		cookieSecure: opts.CookieSecure,
-		logger:       opts.Logger,
-		mux:          http.NewServeMux(),
+		auth:                  opts.Auth,
+		db:                    opts.DB,
+		envelope:              opts.Envelope,
+		cookieSecure:          opts.CookieSecure,
+		captureMaxBytes:       opts.CaptureMaxBytes,
+		models:                opts.Models,
+		probeClient:           opts.ProbeClient,
+		probeTimeout:          opts.ProbeTimeout,
+		modelDiscoveryTimeout: opts.ModelDiscoveryTimeout,
+		runtime:               opts.Runtime,
+		logger:                opts.Logger,
+		mux:                   http.NewServeMux(),
 	}
 	a.registerAuthRoutes()
 	for _, register := range extraRouteRegistrars {

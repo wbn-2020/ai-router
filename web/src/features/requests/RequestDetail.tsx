@@ -486,7 +486,7 @@ const OVERLAY_STYLE: CSSProperties = {
   zIndex: 50,
   display: 'flex',
   justifyContent: 'flex-end',
-  background: 'rgba(15, 23, 42, 0.42)',
+  background: 'var(--color-overlay)',
 };
 
 const DRAWER_STYLE: CSSProperties = {

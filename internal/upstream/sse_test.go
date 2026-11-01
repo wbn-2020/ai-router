@@ -63,7 +63,7 @@ func TestSSEReaderPreservesRawBytesAndFields(t *testing.T) {
 	}
 }
 
-func TestSSEReaderHandlesLFAndUnterminatedFinalEvent(t *testing.T) {
+func TestSSEReaderRejectsUnterminatedFinalEvent(t *testing.T) {
 	input := "data: first\n\n" +
 		"event: message\n" +
 		"data: second\n"
@@ -79,15 +79,8 @@ func TestSSEReaderHandlesLFAndUnterminatedFinalEvent(t *testing.T) {
 		t.Fatalf("第一个事件错误：%+v", first)
 	}
 
-	second, err := reader.Next()
-	if err != nil {
-		t.Fatalf("第二个事件失败：%v", err)
-	}
-	if string(second.Event) != "message" || string(second.Data) != "second" {
-		t.Fatalf("第二个事件错误：%+v", second)
-	}
-	if string(second.Raw) != "event: message\ndata: second\n" {
-		t.Fatalf("未终止事件 Raw = %q", second.Raw)
+	if _, err := reader.Next(); !errors.Is(err, ErrSSETruncatedEvent) {
+		t.Fatalf("EOF 残帧错误 = %v，期望 ErrSSETruncatedEvent", err)
 	}
 
 	if _, err := reader.Next(); !errors.Is(err, io.EOF) {

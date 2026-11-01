@@ -47,7 +47,11 @@ const (
 	// DefaultUpstreamStreamTimeout 是流式请求的总超时。
 	DefaultUpstreamStreamTimeout = 15 * time.Minute
 	// DefaultCapacityWait 是全部候选渠道满载时的最长等待时间。
-	DefaultCapacityWait = 2 * time.Second
+	DefaultCapacityWait           = 2 * time.Second
+	DefaultFirstContentTimeout    = 180 * time.Second
+	DefaultDownstreamWriteTimeout = 30 * time.Second
+	DefaultProbeTimeout           = 60 * time.Second
+	DefaultModelDiscoveryTimeout  = 30 * time.Second
 )
 
 const redacted = "<redacted>"
@@ -68,6 +72,12 @@ const (
 	EnvUpstreamStreamIdleTimeout   = "GATEWAY_UPSTREAM_STREAM_IDLE_TIMEOUT"
 	EnvUpstreamRequestTimeout      = "GATEWAY_UPSTREAM_TIMEOUT"
 	EnvUpstreamStreamTimeout       = "GATEWAY_UPSTREAM_STREAM_TIMEOUT"
+	EnvRequestTimeout              = "GATEWAY_REQUEST_TIMEOUT"
+	EnvStreamTimeout               = "GATEWAY_STREAM_TIMEOUT"
+	EnvFirstContentTimeout         = "GATEWAY_FIRST_CONTENT_TIMEOUT"
+	EnvDownstreamWriteTimeout      = "GATEWAY_DOWNSTREAM_WRITE_TIMEOUT"
+	EnvProbeTimeout                = "GATEWAY_PROBE_TIMEOUT"
+	EnvModelDiscoveryTimeout       = "GATEWAY_MODEL_DISCOVERY_TIMEOUT"
 	EnvMaxAttempts                 = "GATEWAY_MAX_ATTEMPTS"
 	EnvCapacityWait                = "GATEWAY_CAPACITY_WAIT"
 	EnvCaptureMaxBytes             = "GATEWAY_CAPTURE_MAX_BYTES"
@@ -102,6 +112,12 @@ type Config struct {
 	UpstreamStreamIdleTimeout     time.Duration
 	UpstreamRequestTimeout        time.Duration
 	UpstreamStreamTimeout         time.Duration
+	RequestTimeout                time.Duration
+	StreamTimeout                 time.Duration
+	FirstContentTimeout           time.Duration
+	DownstreamWriteTimeout        time.Duration
+	ProbeTimeout                  time.Duration
+	ModelDiscoveryTimeout         time.Duration
 	MaxAttempts                   int
 	CapacityWait                  time.Duration
 	CaptureMaxBytes               int64
@@ -203,6 +219,23 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 	if cfg.UpstreamStreamTimeout, err = durationFromEnv(getenv, EnvUpstreamStreamTimeout, DefaultUpstreamStreamTimeout); err != nil {
 		return Config{}, err
 	}
+	budgets := []struct {
+		name     string
+		target   *time.Duration
+		fallback time.Duration
+	}{
+		{EnvRequestTimeout, &cfg.RequestTimeout, cfg.UpstreamRequestTimeout},
+		{EnvStreamTimeout, &cfg.StreamTimeout, cfg.UpstreamStreamTimeout},
+		{EnvFirstContentTimeout, &cfg.FirstContentTimeout, DefaultFirstContentTimeout},
+		{EnvDownstreamWriteTimeout, &cfg.DownstreamWriteTimeout, DefaultDownstreamWriteTimeout},
+		{EnvProbeTimeout, &cfg.ProbeTimeout, DefaultProbeTimeout},
+		{EnvModelDiscoveryTimeout, &cfg.ModelDiscoveryTimeout, DefaultModelDiscoveryTimeout},
+	}
+	for _, budget := range budgets {
+		if *budget.target, err = durationFromEnv(getenv, budget.name, budget.fallback); err != nil {
+			return Config{}, err
+		}
+	}
 	if cfg.MaxAttempts, err = intFromEnv(getenv, EnvMaxAttempts, DefaultMaxAttempts, 1, DefaultMaxAttempts); err != nil {
 		return Config{}, err
 	}
@@ -219,7 +252,7 @@ func LoadFrom(getenv func(string) string) (Config, error) {
 // String 返回可安全写入日志的配置摘要，所有秘密字段固定输出 <redacted>。
 func (c Config) String() string {
 	return fmt.Sprintf(
-		"Config{listen_addr=%s data_dir=%s db_path=%s master_key=%s client_key=%s admin_password=%s cookie_secure=%t codex_context_window=%d upstream_connect_timeout=%s upstream_tls_timeout=%s upstream_header_timeout=%s upstream_stream_idle_timeout=%s upstream_request_timeout=%s upstream_stream_timeout=%s max_attempts=%d capacity_wait=%s capture_max_bytes=%d}",
+		"Config{listen_addr=%s data_dir=%s db_path=%s master_key=%s client_key=%s admin_password=%s cookie_secure=%t codex_context_window=%d upstream_connect_timeout=%s upstream_tls_timeout=%s upstream_header_timeout=%s upstream_stream_idle_timeout=%s upstream_request_timeout=%s upstream_stream_timeout=%s request_timeout=%s stream_timeout=%s first_content_timeout=%s downstream_write_timeout=%s probe_timeout=%s model_discovery_timeout=%s max_attempts=%d capacity_wait=%s capture_max_bytes=%d}",
 		c.ListenAddr,
 		c.DataDir,
 		c.DBPath,
@@ -234,6 +267,12 @@ func (c Config) String() string {
 		c.UpstreamStreamIdleTimeout,
 		c.UpstreamRequestTimeout,
 		c.UpstreamStreamTimeout,
+		c.RequestTimeout,
+		c.StreamTimeout,
+		c.FirstContentTimeout,
+		c.DownstreamWriteTimeout,
+		c.ProbeTimeout,
+		c.ModelDiscoveryTimeout,
 		c.MaxAttempts,
 		c.CapacityWait,
 		c.CaptureMaxBytes,

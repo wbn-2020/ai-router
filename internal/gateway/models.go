@@ -1,8 +1,11 @@
 package gateway
 
 import (
+	"context"
 	"net/http"
 	"strings"
+
+	"ai-router/internal/store"
 )
 
 const (
@@ -115,8 +118,11 @@ func (h *Handler) serveModel(w http.ResponseWriter, r *http.Request) {
 }
 
 // writeCodexManifest 生成 Codex 模型清单。
+//
+// Codex 只使用原生 Responses 渠道；即使同一客户端模型还映射到 Chat 渠道，
+// 也不能出现在这里，否则客户端会选中一个数据面无法用该协议服务的模型。
 func (h *Handler) writeCodexManifest(w http.ResponseWriter, r *http.Request) {
-	models, ok := h.listEnabledModels(w, r)
+	models, ok := h.listModelsForProtocol(w, r, store.ChannelProtocolOpenAIResponses)
 	if !ok {
 		return
 	}
@@ -125,6 +131,34 @@ func (h *Handler) writeCodexManifest(w http.ResponseWriter, r *http.Request) {
 		builder = buildCodexManifestPlaceholder
 	}
 	writeJSON(w, http.StatusOK, builder(models))
+}
+
+// listModelsForProtocol 优先按入站协议过滤模型；旧 RouteCatalog 实现没有
+// 该能力时回退到全量列表，保持兼容。
+func (h *Handler) listModelsForProtocol(
+	w http.ResponseWriter,
+	r *http.Request,
+	protocol string,
+) ([]string, bool) {
+	if h.routes == nil {
+		writeUnavailable(w)
+		return nil, false
+	}
+	lister, ok := h.routes.(interface {
+		ListModelsByProtocol(context.Context, string) ([]string, error)
+	})
+	if !ok {
+		return h.listEnabledModels(w, r)
+	}
+	models, err := lister.ListModelsByProtocol(r.Context(), protocol)
+	if err != nil {
+		writeInternalError(w)
+		return nil, false
+	}
+	if models == nil {
+		models = make([]string, 0)
+	}
+	return models, true
 }
 
 // listEnabledModels 从启用映射读取客户端模型；空集合返回空切片而非 nil。

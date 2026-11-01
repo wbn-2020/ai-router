@@ -165,6 +165,17 @@ func DefaultCaptureRing() *CaptureRing {
 	return defaultCaptureRing
 }
 
+// ConfigureDefaultCaptureRing 在开始接收请求前用给定上限重建进程级诊断环。
+//
+// 管理 API 通过 DefaultCaptureRing 函数取值，因此与数据面保持同一实例。
+// 必须在任何请求/捕获发生前调用；重复调用会丢弃旧环中的捕获。
+func ConfigureDefaultCaptureRing(opts CaptureRingOptions) *CaptureRing {
+	defaultCaptureRingMu.Lock()
+	defer defaultCaptureRingMu.Unlock()
+	defaultCaptureRing = NewCaptureRing(opts)
+	return defaultCaptureRing
+}
+
 // Capture 写入一条完整捕获并返回实际保存的快照。
 //
 // 非法 request_id 返回 false；body 超过单侧上限时只保留前缀并置
@@ -539,6 +550,8 @@ func teeReadCloser(body io.ReadCloser, dst io.Writer) io.ReadCloser {
 type CaptureStoreOptions struct {
 	// TTL 是保存后的存活时间；<=0 时使用 24h。
 	TTL time.Duration
+	// BodyLimit 是单侧 body 的落库上限；<=0 时使用 DefaultCaptureBodyLimit。
+	BodyLimit int64
 	// Now 用于测试注入时钟；nil 时使用 time.Now。
 	Now func() time.Time
 }
@@ -548,10 +561,11 @@ type CaptureStoreOptions struct {
 // 它复用 secret.Envelope：request/response 两侧使用不同 purpose，
 // 同一 request_id 重复保存会覆盖旧捕获并重置 TTL。
 type CaptureStore struct {
-	db       DB
-	envelope *secret.Envelope
-	ttl      time.Duration
-	now      func() time.Time
+	db        DB
+	envelope  *secret.Envelope
+	ttl       time.Duration
+	bodyLimit int64
+	now       func() time.Time
 }
 
 // NewCaptureStore 构造捕获仓储；envelope 为 nil 时只允许元数据/删除/清理
@@ -560,14 +574,18 @@ func NewCaptureStore(db DB, envelope *secret.Envelope, opts CaptureStoreOptions)
 	if opts.TTL <= 0 {
 		opts.TTL = DefaultCapturePersistenceTTL
 	}
+	if opts.BodyLimit <= 0 {
+		opts.BodyLimit = DefaultCaptureBodyLimit
+	}
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
 	return &CaptureStore{
-		db:       db,
-		envelope: envelope,
-		ttl:      opts.TTL,
-		now:      opts.Now,
+		db:        db,
+		envelope:  envelope,
+		ttl:       opts.TTL,
+		bodyLimit: opts.BodyLimit,
+		now:       opts.Now,
 	}
 }
 
@@ -629,10 +647,10 @@ func (s *CaptureStore) Save(ctx context.Context, snapshot CaptureSnapshot) (Capt
 	if err := validateRequestID(requestID); err != nil {
 		return CaptureMeta{}, err
 	}
-	// 即使调用方绕过了诊断环，也保证落库单侧不超过 8MB；超出的部分
+	// 即使调用方绕过了诊断环，也保证落库单侧不超过配置上限；超出的部分
 	// 不写入密文，只保留 truncated 标志。
-	snapshot.Request = trimCaptureBody(snapshot.Request, DefaultCaptureBodyLimit)
-	snapshot.Response = trimCaptureBody(snapshot.Response, DefaultCaptureBodyLimit)
+	snapshot.Request = trimCaptureBody(snapshot.Request, s.bodyLimit)
+	snapshot.Response = trimCaptureBody(snapshot.Response, s.bodyLimit)
 
 	requestCiphertext, requestBytes, err := s.encryptSide(snapshot.Request, captureRequestPurpose)
 	if err != nil {

@@ -164,7 +164,7 @@ describe('调试页：渠道与模型测试', () => {
 
     expect(await screen.findByText('128 ms')).toBeInTheDocument();
     expect(screen.getByText('200', { selector: 'code' })).toBeInTheDocument();
-    expect(screen.getByText(/正常/)).toBeInTheDocument();
+    expect(screen.getByText(/渠道测试 · 通过/)).toBeInTheDocument();
     expect(screen.getByText('gpt-5.1-codex')).toBeInTheDocument();
 
     const link = screen.getByRole('link', { name: '查看该渠道最近的请求' });
@@ -262,13 +262,41 @@ describe('调试页：渠道与模型测试', () => {
 
     expect(await screen.findByText('64 ms')).toBeInTheDocument();
     expect(screen.getByText('gpt-4-mini-upstream')).toBeInTheDocument();
-    expect(screen.getByText(/模型测试 · 正常/)).toBeInTheDocument();
+    expect(screen.getByText(/模型测试 · 通过/)).toBeInTheDocument();
 
     const link = screen.getByRole('link', { name: '查看该渠道最近的请求' });
     expect(link).toHaveAttribute('href', MODEL_RESULT.request_link);
     expect(hasRequest(fetchMock, '/admin/api/debug/models/gpt-4.1-mini/test', 'POST')).toBe(
       true,
     );
+  });
+
+  it('预算截断显示不确定而非通过或失败，并展示生成上下文', async () => {
+    installFetch((url, init) => mockOptions()(url, init) ?? jsonResponse({
+      ...CHANNEL_RESULT,
+      status: 'inconclusive',
+      error_code: 'output_limit',
+      error: '输出预算耗尽',
+      duration_ms: 720,
+      protocol: 'openai_responses',
+      connection_revision: 4,
+      kind: 'generation',
+    }));
+    const user = userEvent.setup();
+    render(<DebugPage />);
+    await waitForLoadedOptions();
+    await user.selectOptions(screen.getByLabelText('渠道'), '1');
+    await user.click(screen.getByRole('button', { name: '测试渠道' }));
+    expect(await screen.findByText('inconclusive')).toBeInTheDocument();
+    expect(screen.getByText(/渠道测试 · 不确定/)).toBeInTheDocument();
+    expect(screen.queryByText('unhealthy')).not.toBeInTheDocument();
+    expect(screen.getByText('720 ms')).toBeInTheDocument();
+    expect(screen.getByText('128 ms')).toBeInTheDocument();
+    expect(screen.getByText('output_limit')).toBeInTheDocument();
+    expect(screen.getByText('openai_responses', { selector: 'code' })).toBeInTheDocument();
+    expect(screen.getByText('v4')).toBeInTheDocument();
+    expect(screen.getByText(/不代表通过或失败/)).toBeInTheDocument();
+    expect(screen.getByText(/不代表全部模型或全部能力/)).toBeInTheDocument();
   });
 
   it('无映射模型返回明确错误', async () => {

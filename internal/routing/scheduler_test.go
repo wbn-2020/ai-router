@@ -270,7 +270,8 @@ func TestSchedulerFiltersCandidates(t *testing.T) {
 		3: {ID: 3, Protocol: store.ChannelProtocolOpenAIChat, Enabled: true, Priority: 0, MaxConcurrency: 1},
 		4: {ID: 4, Protocol: responseProtocol, Enabled: true, Priority: 0, MaxConcurrency: 1},
 	}}
-	scheduler, err := New(Options{Routes: routes, Channels: channels})
+	clock := &fakeClock{now: time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)}
+	scheduler, err := New(Options{Routes: routes, Channels: channels, Clock: clock.Now})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -285,17 +286,28 @@ func TestSchedulerFiltersCandidates(t *testing.T) {
 			routes.model, routes.protocol, responseProtocol)
 	}
 
-	// 熔断打开后候选被过滤；成功重置后恢复。
-	if !scheduler.RecordFailure(4, 429, "upstream rate limited") {
+	// 熔断打开后候选被过滤；只有到期后的恢复请求成功才清除。
+	failed, failedSlot, err := scheduler.AcquireExcluding(context.Background(), "m", responseProtocol, map[int64]struct{}{1: {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !scheduler.RecordFailure(failed, Failure{Status: 429, Message: "upstream rate limited"}) {
 		t.Fatal("429 应触发熔断")
 	}
+	failedSlot.Release()
 	candidates, err = scheduler.Candidates(context.Background(), "m", responseProtocol)
 	if err != nil {
 		t.Fatalf("Candidates with open circuit: %v", err)
 	}
 	assertCandidateRouteIDs(t, candidates, 1)
 
-	scheduler.RecordSuccess(4)
+	clock.Advance(DefaultRateLimitCircuitWindow)
+	recovery, recoverySlot, err := scheduler.AcquireExcluding(context.Background(), "m", responseProtocol, map[int64]struct{}{1: {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler.RecordSuccess(recovery)
+	recoverySlot.Release()
 	candidates, err = scheduler.Candidates(context.Background(), "m", responseProtocol)
 	if err != nil {
 		t.Fatalf("Candidates after reset: %v", err)
@@ -698,6 +710,8 @@ func TestSchedulerCircuitWindows(t *testing.T) {
 		window time.Duration
 		trips  bool
 	}{
+		{-1, 20 * time.Second, true},
+		{0, 20 * time.Second, true},
 		{400, 0, false},
 		{401, 5 * time.Minute, true},
 		{403, 5 * time.Minute, true},
@@ -708,8 +722,12 @@ func TestSchedulerCircuitWindows(t *testing.T) {
 		{600, 0, false},
 	}
 	for _, tt := range tests {
-		scheduler.RecordSuccess(1)
-		tripped := scheduler.RecordFailure(1, tt.status, "upstream error")
+		candidate, slot, err := scheduler.Acquire(ctx, "m", protocol)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tripped := scheduler.RecordFailure(candidate, Failure{Status: tt.status, Message: "upstream error"})
+		slot.Release()
 		if tripped != tt.trips {
 			t.Errorf("status=%d RecordFailure = %v，期望 %v", tt.status, tripped, tt.trips)
 			continue
@@ -737,8 +755,8 @@ func TestSchedulerCircuitWindows(t *testing.T) {
 			t.Fatalf("Candidates(open): %v", err)
 		}
 		assertCandidateRouteIDs(t, candidates)
-		if _, _, err := scheduler.Acquire(ctx, "m", protocol); !errors.Is(err, ErrNoCandidates) {
-			t.Errorf("熔断时 Acquire 错误 = %v，期望 ErrNoCandidates", err)
+		if _, _, err := scheduler.Acquire(ctx, "m", protocol); !errors.Is(err, ErrAllCircuitsOpen) {
+			t.Errorf("熔断时 Acquire 错误 = %v，期望 ErrAllCircuitsOpen", err)
 		}
 
 		clock.Advance(tt.window - time.Millisecond)
@@ -751,11 +769,28 @@ func TestSchedulerCircuitWindows(t *testing.T) {
 			t.Fatalf("Candidates(expired): %v", err)
 		}
 		assertCandidateRouteIDs(t, candidates, 1)
+		recovery, recoverySlot, err := scheduler.Acquire(ctx, "m", protocol)
+		if err != nil {
+			t.Fatal(err)
+		}
+		scheduler.RecordSuccess(recovery)
+		recoverySlot.Release()
 	}
 
-	// 成功重置清空熔断与 last_error。
-	scheduler.RecordFailure(1, 503, "server error")
-	scheduler.RecordSuccess(1)
+	// 成功恢复清空熔断与 last_error。
+	failed, failedSlot, err := scheduler.Acquire(ctx, "m", protocol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler.RecordFailure(failed, Failure{Status: 503, Message: "server error"})
+	failedSlot.Release()
+	clock.Advance(DefaultServerErrorCircuitWindow)
+	recovered, recoveredSlot, err := scheduler.Acquire(ctx, "m", protocol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler.RecordSuccess(recovered)
+	recoveredSlot.Release()
 	if snapshot := scheduler.Circuit(1); snapshot.Open || snapshot.LastError != "" {
 		t.Fatalf("RecordSuccess 后状态 = %+v，期望清空", snapshot)
 	}
@@ -764,6 +799,385 @@ func TestSchedulerCircuitWindows(t *testing.T) {
 		t.Fatalf("Candidates(after success): %v", err)
 	}
 	assertCandidateRouteIDs(t, candidates, 1)
+}
+
+func newTicketScheduler(t *testing.T, limit int) (*Scheduler, *fakeClock, *fakeChannelCatalog) {
+	t.Helper()
+	clock := &fakeClock{now: time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)}
+	channels := &fakeChannelCatalog{channels: map[int64]store.Channel{
+		1: {ID: 1, ConnectionRevision: 1, Protocol: store.ChannelProtocolOpenAIResponses, Enabled: true, MaxConcurrency: limit},
+	}}
+	scheduler, err := New(Options{
+		Routes: &fakeRouteCatalog{routes: []store.ModelRoute{
+			{ID: 1, ChannelID: 1, Enabled: true, UpstreamModel: "upstream-a"},
+		}}, Channels: channels, Clock: clock.Now, DisableCapacityWait: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return scheduler, clock, channels
+}
+
+func acquireTicket(t *testing.T, scheduler *Scheduler) (Candidate, *Slot) {
+	t.Helper()
+	candidate, slot, err := scheduler.Acquire(context.Background(), "m", store.ChannelProtocolOpenAIResponses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(slot.Release)
+	return candidate, slot
+}
+
+func TestTicketFailureGenerationsAndLongerDeadline(t *testing.T) {
+	scheduler, clock, channels := newTicketScheduler(t, 8)
+	staleSuccess, staleSlot := acquireTicket(t, scheduler)
+	long, longSlot := acquireTicket(t, scheduler)
+	short, shortSlot := acquireTicket(t, scheduler)
+	veryLate, lateSlot := acquireTicket(t, scheduler)
+	if !scheduler.RecordFailure(long, Failure{Status: 401, Message: "auth"}) {
+		t.Fatal("auth failure did not trip")
+	}
+	longSlot.Release()
+	until := scheduler.Circuit(1).OpenUntil
+	clock.Advance(time.Second)
+	if !scheduler.RecordFailure(short, Failure{Status: 429, Message: "rate", RetryAfter: time.Second}) {
+		t.Fatal("concurrent failure was lost")
+	}
+	shortSlot.Release()
+	scheduler.RecordSuccess(staleSuccess)
+	staleSlot.Release()
+	if got := scheduler.Circuit(1); !got.OpenUntil.Equal(until) || got.LastError != "rate" {
+		t.Fatalf("old success or shorter deadline replaced state: %+v", got)
+	}
+	if scheduler.RecordFailure(long, Failure{Status: 500, Message: "duplicate"}) {
+		t.Fatal("ticket completion must be idempotent")
+	}
+	clock.Advance(DefaultAuthCircuitWindow)
+	if got := scheduler.Runtime(channels.channels[1]); got.State != "recovering" {
+		t.Fatalf("expired circuit must await recovery: %+v", got)
+	}
+	recovery, recoverySlot := acquireTicket(t, scheduler)
+	scheduler.RecordSuccess(recovery)
+	recoverySlot.Release()
+	if scheduler.RecordFailure(veryLate, Failure{Status: 503, Message: "old epoch"}) {
+		t.Fatal("old failure resurrected a recovered circuit")
+	}
+	lateSlot.Release()
+	if got := scheduler.Runtime(channels.channels[1]); got.State != "ready" || got.LastError != "" || got.OpenUntil != nil {
+		t.Fatalf("recovery did not clear state: %+v", got)
+	}
+}
+
+func TestNewFailureInvalidatesInFlightRecovery(t *testing.T) {
+	scheduler, clock, _ := newTicketScheduler(t, 8)
+	lateFailure, lateSlot := acquireTicket(t, scheduler)
+	failed, failedSlot := acquireTicket(t, scheduler)
+	scheduler.RecordFailure(failed, Failure{Status: 503})
+	failedSlot.Release()
+	clock.Advance(DefaultServerErrorCircuitWindow)
+	recovery, recoverySlot := acquireTicket(t, scheduler)
+	if !scheduler.RecordFailure(lateFailure, Failure{Status: 401, Message: "new failure"}) {
+		t.Fatal("new failure was ignored while recovery ran")
+	}
+	lateSlot.Release()
+	scheduler.RecordSuccess(recovery)
+	recoverySlot.Release()
+	if got := scheduler.Circuit(1); !got.Open || got.LastError != "new failure" {
+		t.Fatalf("recovery success erased a newer failure: %+v", got)
+	}
+	if _, _, err := scheduler.Acquire(context.Background(), "m", store.ChannelProtocolOpenAIResponses); !errors.Is(err, ErrAllCircuitsOpen) {
+		t.Fatalf("new cooldown no longer enforced: %v", err)
+	}
+}
+
+func TestCanceledAcquireReturnsRecoveryPermit(t *testing.T) {
+	scheduler, clock, channels := newTicketScheduler(t, 1)
+	failed, failedSlot := acquireTicket(t, scheduler)
+	scheduler.RecordFailure(failed, Failure{Status: 503})
+	failedSlot.Release()
+	clock.Advance(DefaultServerErrorCircuitWindow)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	scheduler.lastUsed = lastUsedFunc(func(context.Context, int64, time.Time) error {
+		cancel()
+		return nil
+	})
+	if _, slot, err := scheduler.Acquire(ctx, "m", store.ChannelProtocolOpenAIResponses); !errors.Is(err, context.Canceled) {
+		slot.Release()
+		t.Fatalf("canceled dispatch escaped: %v", err)
+	}
+	if got := scheduler.Runtime(channels.channels[1]); got.State != "recovering" || got.InUse != 0 {
+		t.Fatalf("cancellation leaked reservation: %+v", got)
+	}
+	scheduler.lastUsed = nil
+	probe, slot := acquireTicket(t, scheduler)
+	scheduler.RecordSuccess(probe)
+	slot.Release()
+}
+
+type lastUsedFunc func(context.Context, int64, time.Time) error
+
+func (f lastUsedFunc) TouchLastUsed(ctx context.Context, id int64, at time.Time) error {
+	return f(ctx, id, at)
+}
+
+func TestRecoveryAllowsOneConcurrentDispatchAndRelease(t *testing.T) {
+	scheduler, clock, channels := newTicketScheduler(t, 64)
+	failed, slot := acquireTicket(t, scheduler)
+	scheduler.RecordFailure(failed, Failure{Status: 503})
+	slot.Release()
+	clock.Advance(DefaultServerErrorCircuitWindow)
+	for i := 0; i < 3; i++ {
+		candidates, err := scheduler.Candidates(context.Background(), "m", store.ChannelProtocolOpenAIResponses)
+		if err != nil || len(candidates) != 1 {
+			t.Fatalf("read consumed probe: %v %v", candidates, err)
+		}
+		if got := scheduler.Runtime(channels.channels[1]); got.State != "recovering" || got.InUse != 0 {
+			t.Fatalf("read mutated runtime: %+v", got)
+		}
+	}
+	type result struct {
+		candidate Candidate
+		slot      *Slot
+		err       error
+	}
+	results := make(chan result, 32)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < cap(results); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			candidate, slot, err := scheduler.Acquire(context.Background(), "m", store.ChannelProtocolOpenAIResponses)
+			results <- result{candidate, slot, err}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	var winner result
+	winners := 0
+	for result := range results {
+		if result.err == nil {
+			winners++
+			winner = result
+		} else if !errors.Is(result.err, ErrAllCircuitsOpen) {
+			t.Errorf("unexpected loser error: %v", result.err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("recovery permits = %d, want 1", winners)
+	}
+	winner.slot.Release()
+	winner.slot.Release()
+	// A late result after cancellation cannot consume a replacement permit.
+	replacement, replacementSlot := acquireTicket(t, scheduler)
+	scheduler.RecordSuccess(winner.candidate)
+	if scheduler.RecordFailure(winner.candidate, Failure{Status: 401}) {
+		t.Fatal("released ticket affected replacement")
+	}
+	if _, _, err := scheduler.Acquire(context.Background(), "m", store.ChannelProtocolOpenAIResponses); !errors.Is(err, ErrAllCircuitsOpen) {
+		t.Fatalf("replacement probe lost ownership: %v", err)
+	}
+	copy := replacement
+	scheduler.RecordSuccess(copy)
+	scheduler.RecordFailure(replacement, Failure{Status: 500})
+	replacementSlot.Release()
+	if got := scheduler.Runtime(channels.channels[1]); got.State != "ready" || got.InUse != 0 {
+		t.Fatalf("copy lost completion identity: %+v", got)
+	}
+}
+
+func TestFailureScopesAndModelIsolation(t *testing.T) {
+	scheduler, clock, channels := newTicketScheduler(t, 8)
+	ctx := context.Background()
+	protocol := store.ChannelProtocolOpenAIResponses
+	request, requestSlot := acquireTicket(t, scheduler)
+	if scheduler.RecordFailure(request, Failure{Scope: FailureScopeRequest, Status: 503}) {
+		t.Fatal("request failure tripped channel")
+	}
+	requestSlot.Release()
+	failed, failedSlot := acquireTicket(t, scheduler)
+	if !scheduler.RecordFailure(failed, Failure{Scope: FailureScopeModel, Status: 404, Message: "missing"}) {
+		t.Fatal("model not found should cool only model")
+	}
+	failedSlot.Release()
+	if got := scheduler.Runtime(channels.channels[1]); got.State != "ready" || got.LastError != "" || got.ModelCooldowns != 1 {
+		t.Fatalf("model failure polluted channel state: %+v", got)
+	}
+	if _, _, err := scheduler.Acquire(ctx, "m", protocol); !errors.Is(err, ErrAllCircuitsOpen) {
+		t.Fatalf("same upstream model should be blocked: %v", err)
+	}
+	routes := scheduler.routes.(*fakeRouteCatalog)
+	routes.routes[0].UpstreamModel = "upstream-b"
+	other, otherSlot := acquireTicket(t, scheduler)
+	scheduler.RecordSuccess(other)
+	otherSlot.Release()
+	// The protocol is also part of the local circuit key.
+	channel := channels.channels[1]
+	channel.Protocol = store.ChannelProtocolOpenAIChat
+	channels.channels[1] = channel
+	routes.routes[0].UpstreamModel = "upstream-a"
+	other, otherSlot, err := scheduler.Acquire(ctx, "m", channel.Protocol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler.RecordSuccess(other)
+	otherSlot.Release()
+	channel.Protocol = protocol
+	channels.channels[1] = channel
+	clock.Advance(DefaultServerErrorCircuitWindow)
+	if got := scheduler.Runtime(channel); got.State != "ready" || got.ModelRecovering != 1 || got.ModelCooldowns != 0 {
+		t.Fatalf("expired model state: %+v", got)
+	}
+	probe, probeSlot := acquireTicket(t, scheduler)
+	if scheduler.RecordFailure(probe, Failure{Scope: FailureScopeRequest, Status: 400}) {
+		t.Fatal("request failure must release, not resolve recovery")
+	}
+	probeSlot.Release()
+	probe, probeSlot = acquireTicket(t, scheduler)
+	if !scheduler.RecordFailure(probe, Failure{Scope: "unknown", Status: 503}) {
+		t.Fatal("unknown scope must use channel")
+	}
+	probeSlot.Release()
+	if got := scheduler.Runtime(channel); got.State != "cooldown" || got.ModelRecovering != 1 {
+		t.Fatalf("scope handling: %+v", got)
+	}
+}
+
+func TestTicketConnectionRevision(t *testing.T) {
+	scheduler, _, channels := newTicketScheduler(t, 8)
+	oldSuccess, oldSuccessSlot := acquireTicket(t, scheduler)
+	oldFailure, oldFailureSlot := acquireTicket(t, scheduler)
+	channel := channels.channels[1]
+	channel.ConnectionRevision++
+	channels.channels[1] = channel
+	// No new dispatch has observed revision 2 yet: feedback still rechecks store.
+	if scheduler.RecordFailure(oldFailure, Failure{Status: 401}) {
+		t.Fatal("old connection failure accepted")
+	}
+	oldFailureSlot.Release()
+	fresh, freshSlot := acquireTicket(t, scheduler)
+	if !scheduler.RecordFailure(fresh, Failure{Status: 503, Message: "new connection"}) {
+		t.Fatal("new connection failure not accepted")
+	}
+	freshSlot.Release()
+	scheduler.RecordSuccess(oldSuccess)
+	oldSuccessSlot.Release()
+	if got := scheduler.Runtime(channel); got.State != "cooldown" || got.LastError != "new connection" {
+		t.Fatalf("old success overwrote new revision: %+v", got)
+	}
+	channel.ConnectionRevision++
+	channels.channels[1] = channel
+	if got := scheduler.Runtime(channel); got.State != "ready" || got.LastError != "" {
+		t.Fatalf("new revision inherited old fault: %+v", got)
+	}
+	_, slot := acquireTicket(t, scheduler)
+	slot.Release()
+}
+
+func TestRetryAfterBoundsAndUnissuedTicket(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		retryAfter, want time.Duration
+	}{
+		{"positive", 37 * time.Second, 37 * time.Second},
+		{"cap", time.Hour, MaxRetryAfter},
+		{"zero", 0, DefaultRateLimitCircuitWindow},
+		{"negative", -time.Second, DefaultRateLimitCircuitWindow},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scheduler, clock, _ := newTicketScheduler(t, 1)
+			candidates, err := scheduler.Candidates(context.Background(), "m", store.ChannelProtocolOpenAIResponses)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scheduler.RecordFailure(candidates[0], Failure{Status: 401}) {
+				t.Fatal("read-only candidate issued feedback")
+			}
+			candidate, slot := acquireTicket(t, scheduler)
+			scheduler.RecordFailure(candidate, Failure{Status: 429, RetryAfter: test.retryAfter})
+			slot.Release()
+			if got := scheduler.Circuit(1).OpenUntil.Sub(clock.Now()); got != test.want {
+				t.Fatalf("window = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestAcquireRechecksAfterReservingSlot(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		change func(*store.Channel)
+	}{
+		{"disabled", func(c *store.Channel) { c.Enabled = false }},
+		{"protocol", func(c *store.Channel) { c.Protocol = store.ChannelProtocolOpenAIChat }},
+		{"revision", func(c *store.Channel) { c.ConnectionRevision++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scheduler, _, channels := newTicketScheduler(t, 1)
+			channels.beforeGet = func(n int) {
+				if n == 2 {
+					c := channels.channels[1]
+					test.change(&c)
+					channels.channels[1] = c
+				}
+			}
+			if _, slot, err := scheduler.Acquire(context.Background(), "m", store.ChannelProtocolOpenAIResponses); !errors.Is(err, ErrNoCandidates) {
+				slot.Release()
+				t.Fatalf("stale candidate dispatched: %v", err)
+			}
+			if got := scheduler.limiter.InUse(1); got != 0 {
+				t.Fatalf("leaked reservation: %d", got)
+			}
+		})
+	}
+	t.Run("limit shrink", func(t *testing.T) {
+		scheduler, _, channels := newTicketScheduler(t, 2)
+		_, held := acquireTicket(t, scheduler)
+		channels.beforeGet = func(n int) {
+			if n == 4 {
+				c := channels.channels[1]
+				c.MaxConcurrency = 1
+				channels.channels[1] = c
+			}
+		}
+		if _, slot, err := scheduler.Acquire(context.Background(), "m", store.ChannelProtocolOpenAIResponses); !errors.Is(err, ErrChannelCapacity) {
+			slot.Release()
+			t.Fatalf("shrunken capacity accepted: %v", err)
+		}
+		if got := scheduler.limiter.InUse(1); got != 1 {
+			t.Fatalf("reservation not rolled back: %d", got)
+		}
+		held.Release()
+	})
+}
+
+func TestWaitingDoesNotPollCatalogAndRechecksBeforeDispatch(t *testing.T) {
+	scheduler, _, channels := newTicketScheduler(t, 1)
+	scheduler.noWait = false
+	scheduler.capacityWait = 20 * time.Millisecond
+	scheduler.capacityPoll = time.Millisecond
+	_, held := acquireTicket(t, scheduler)
+	if _, _, err := scheduler.Acquire(context.Background(), "m", store.ChannelProtocolOpenAIResponses); !errors.Is(err, ErrChannelCapacity) {
+		t.Fatal(err)
+	}
+	if channels.reads != 3 {
+		t.Fatalf("full channel polled catalog %d times", channels.reads)
+	}
+	channels.beforeGet = func(n int) {
+		if n == 4 {
+			c := channels.channels[1]
+			c.Enabled = false
+			channels.channels[1] = c
+			held.Release()
+		}
+	}
+	if _, slot, err := scheduler.Acquire(context.Background(), "m", store.ChannelProtocolOpenAIResponses); !errors.Is(err, ErrNoCandidates) {
+		slot.Release()
+		t.Fatalf("disabled waiting channel dispatched: %v", err)
+	}
 }
 
 // fakeClock 是可手动推进的测试时钟。
@@ -786,6 +1200,7 @@ func (c *fakeClock) Advance(d time.Duration) {
 
 // fakeRouteCatalog 返回固定映射，便于测试不依赖 SQLite 的过滤逻辑。
 type fakeRouteCatalog struct {
+	mu       sync.Mutex
 	routes   []store.ModelRoute
 	err      error
 	model    string
@@ -796,6 +1211,8 @@ func (f *fakeRouteCatalog) ListByModelAndProtocol(
 	_ context.Context,
 	clientModel, protocol string,
 ) ([]store.ModelRoute, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.model = clientModel
 	f.protocol = protocol
 	if f.err != nil {
@@ -805,11 +1222,20 @@ func (f *fakeRouteCatalog) ListByModelAndProtocol(
 }
 
 type fakeChannelCatalog struct {
-	channels map[int64]store.Channel
-	errors   map[int64]error
+	mu        sync.Mutex
+	channels  map[int64]store.Channel
+	errors    map[int64]error
+	reads     int
+	beforeGet func(int)
 }
 
 func (f *fakeChannelCatalog) Get(_ context.Context, id int64) (store.Channel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reads++
+	if f.beforeGet != nil {
+		f.beforeGet(f.reads)
+	}
 	if err, ok := f.errors[id]; ok {
 		return store.Channel{}, err
 	}
@@ -841,4 +1267,32 @@ func (f *fakeLastUsed) snapshot() []lastUsedTouch {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]lastUsedTouch(nil), f.touches...)
+}
+
+// TestSchedulerDisableCapacityWaitFailsImmediately 覆盖 C3：
+// GATEWAY_CAPACITY_WAIT=0 必须立即失败，而不是回落到默认 2s 等待。
+func TestSchedulerDisableCapacityWaitFailsImmediately(t *testing.T) {
+	ctx := context.Background()
+	s := newRoutingTestStore(t)
+	protocol := store.ChannelProtocolOpenAIResponses
+	channel := createRoutingChannel(t, s.Channels(), "nowait", protocol, 0, 1, true)
+	createRoutingRoute(t, s.ModelRoutes(), "m", channel.ID, 0, true)
+
+	scheduler := newStoreScheduler(t, s, Options{
+		CapacityWait:        2 * time.Second,
+		DisableCapacityWait: true,
+	})
+	_, slot, err := scheduler.Acquire(ctx, "m", protocol)
+	if err != nil {
+		t.Fatalf("Acquire(first): %v", err)
+	}
+	defer slot.Release()
+
+	started := time.Now()
+	if _, _, err := scheduler.Acquire(ctx, "m", protocol); !errors.Is(err, ErrChannelCapacity) {
+		t.Fatalf("满载错误 = %v，期望 ErrChannelCapacity", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("DisableCapacityWait 下等待了 %v，应接近 0", elapsed)
+	}
 }

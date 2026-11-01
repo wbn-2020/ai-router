@@ -18,10 +18,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"strings"
 	"time"
 
+	"ai-router/internal/config"
 	"ai-router/internal/observability"
 	"ai-router/internal/routing"
 	"ai-router/internal/upstream"
@@ -34,6 +36,10 @@ const (
 	// 字节；8 MiB 足以覆盖异常大的 reasoning/工具预置内容，同时避免恶意上游
 	// 在提交前无限占用内存。
 	defaultStreamBufferLimit = 8 << 20
+
+	// maxNonSSEBodyBytes 限制读取“请求了 stream 但上游返回 JSON”的响应体，
+	// 只用于丢弃，避免异常上游用大 body 占满内存。
+	maxNonSSEBodyBytes int64 = 64 << 10
 
 	streamContentType = "text/event-stream; charset=utf-8"
 )
@@ -49,6 +55,12 @@ type StreamProxyOptions struct {
 	Journal    AttemptJournal
 	DecryptKey func(ciphertext string) (string, error)
 
+	// MaxAttempts 是单次请求最多尝试的不同渠道数；<= 0 时使用默认值 3。
+	MaxAttempts         int
+	RequestTimeout      time.Duration
+	FirstContentTimeout time.Duration
+	WriteTimeout        time.Duration
+
 	Logger *slog.Logger
 	// Clock 为零时使用 time.Now。
 	Clock func() time.Time
@@ -58,13 +70,17 @@ type StreamProxyOptions struct {
 
 // StreamProxy 是流式数据面代理。构造后字段不可变，可并发使用。
 type StreamProxy struct {
-	scheduler    CandidateScheduler
-	upstream     UpstreamSender
-	journal      AttemptJournal
-	decryptKey   func(string) (string, error)
-	logger       *slog.Logger
-	now          func() time.Time
-	newRequestID func(*http.Request) string
+	scheduler           CandidateScheduler
+	upstream            UpstreamSender
+	journal             AttemptJournal
+	decryptKey          func(string) (string, error)
+	maxAttempts         int
+	requestTimeout      time.Duration
+	firstContentTimeout time.Duration
+	writeTimeout        time.Duration
+	logger              *slog.Logger
+	now                 func() time.Time
+	newRequestID        func(*http.Request) string
 
 	// maxBufferBytes 只由测试调整；生产使用 defaultStreamBufferLimit。
 	maxBufferBytes int
@@ -94,14 +110,18 @@ func NewStreamProxy(opts StreamProxyOptions) (*StreamProxy, error) {
 		logger = slog.Default()
 	}
 	return &StreamProxy{
-		scheduler:      opts.Scheduler,
-		upstream:       opts.Upstream,
-		journal:        opts.Journal,
-		decryptKey:     opts.DecryptKey,
-		logger:         logger,
-		now:            now,
-		newRequestID:   opts.RequestID,
-		maxBufferBytes: defaultStreamBufferLimit,
+		scheduler:           opts.Scheduler,
+		upstream:            opts.Upstream,
+		journal:             opts.Journal,
+		decryptKey:          opts.DecryptKey,
+		maxAttempts:         normalizeMaxAttempts(opts.MaxAttempts),
+		requestTimeout:      timeoutOrDefault(opts.RequestTimeout, config.DefaultUpstreamStreamTimeout),
+		firstContentTimeout: timeoutOrDefault(opts.FirstContentTimeout, config.DefaultFirstContentTimeout),
+		writeTimeout:        timeoutOrDefault(opts.WriteTimeout, config.DefaultDownstreamWriteTimeout),
+		logger:              logger,
+		now:                 now,
+		newRequestID:        opts.RequestID,
+		maxBufferBytes:      defaultStreamBufferLimit,
 	}, nil
 }
 
@@ -116,7 +136,9 @@ type streamFrameClass struct {
 	terminal bool
 	// failure 表示上游明确报告失败（Responses response.failed/error、
 	// Chat error 对象或 event: error）。
-	failure bool
+	failure    bool
+	invalid    bool
+	incomplete bool
 }
 
 // streamGate 管理“首语义内容前缓冲、提交后直通”的状态。
@@ -124,26 +146,28 @@ type streamFrameClass struct {
 // committed 一旦为 true，HTTP 200 与 SSE 响应头已经写出，调用方不得再回退
 // 到 JSON 错误，也不得切换渠道。pending 只在未提交时保存原始 SSE 字节。
 type streamGate struct {
-	protocol    string
-	info        RequestInfo
-	requestID   string
-	w           http.ResponseWriter
-	flusher     http.Flusher
-	maxBuffer   int
-	pending     []byte
-	committed   bool
-	completed   bool
-	written     int64
-	lastByte    byte
-	blankTail   bool
-	responseID  string
-	createdAt   int64
-	model       string
-	lastSeq     int64
-	hasSequence bool
-	ttftMS      *int64
-	requestAt   time.Time
-	now         func() time.Time
+	protocol     string
+	info         RequestInfo
+	requestID    string
+	w            http.ResponseWriter
+	ctx          context.Context
+	writeTimeout time.Duration
+	firstBudget  *firstContentBudget
+	maxBuffer    int
+	pending      []byte
+	committed    bool
+	completed    bool
+	written      int64
+	lastByte     byte
+	blankTail    bool
+	responseID   string
+	createdAt    int64
+	model        string
+	lastSeq      int64
+	hasSequence  bool
+	ttftMS       *int64
+	requestAt    time.Time
+	now          func() time.Time
 }
 
 // buffer 保存提交前的原始事件，并执行缓冲上限。
@@ -161,9 +185,15 @@ func (g *streamGate) buffer(raw []byte) error {
 // commit 写出 SSE 响应头以及首语义内容之前的缓冲，再写出当前事件。
 //
 // 第一次调用时写入 HTTP 200；之后的调用只追加事件。Write 或 Flush 失败
-// 表示客户端已断开，调用方必须取消上游并停止重试。
+// 必须取消上游并停止重试；只有入站 context 取消才记为客户端取消。
 func (g *streamGate) commit(raw []byte) error {
 	if !g.committed {
+		if err := g.firstBudget.commit(); err != nil {
+			return err
+		}
+		if err := renewWriteDeadline(g.ctx, g.w, g.writeTimeout); err != nil {
+			return err
+		}
 		header := g.w.Header()
 		header.Set("Content-Type", streamContentType)
 		header.Set("Cache-Control", "no-store")
@@ -178,7 +208,9 @@ func (g *streamGate) commit(raw []byte) error {
 			}
 			g.pending = nil
 		}
-		g.flusher.Flush()
+		if err := http.NewResponseController(g.w).Flush(); err != nil {
+			return err
+		}
 		ttft := g.now().Sub(g.requestAt).Milliseconds()
 		if ttft < 0 {
 			ttft = 0
@@ -193,15 +225,20 @@ func (g *streamGate) write(raw []byte) error {
 	if len(raw) == 0 {
 		return nil
 	}
+	if err := renewWriteDeadline(g.ctx, g.w, g.writeTimeout); err != nil {
+		return err
+	}
 	n, err := g.w.Write(raw)
 	g.written += int64(n)
 	if err != nil {
 		return err
 	}
+	if n != len(raw) {
+		return io.ErrShortWrite
+	}
 	g.lastByte = raw[len(raw)-1]
 	g.blankTail = hasBlankLineSuffix(raw)
-	g.flusher.Flush()
-	return nil
+	return http.NewResponseController(g.w).Flush()
 }
 
 // hasBlankLineSuffix 判断一段已写出的 SSE 字节是否以空行结束。
@@ -372,9 +409,16 @@ func classifyStreamFrame(protocol string, event upstream.SSEEvent) streamFrameCl
 
 // responsesEnvelope 是分类 Responses 事件所需的最小子集。
 type responsesEnvelope struct {
-	Type  string          `json:"type"`
-	Delta json.RawMessage `json:"delta"`
-	Error json.RawMessage `json:"error"`
+	Type     string          `json:"type"`
+	Delta    json.RawMessage `json:"delta"`
+	Error    json.RawMessage `json:"error"`
+	Response *struct {
+		ID     string          `json:"id"`
+		Object string          `json:"object"`
+		Status string          `json:"status"`
+		Output json.RawMessage `json:"output"`
+		Error  json.RawMessage `json:"error"`
+	} `json:"response"`
 }
 
 func classifyResponsesFrame(event upstream.SSEEvent) streamFrameClass {
@@ -384,6 +428,9 @@ func classifyResponsesFrame(event upstream.SSEEvent) streamFrameClass {
 		if err := json.Unmarshal(event.Data, &payload); err != nil {
 			if kind == "error" {
 				return streamFrameClass{failure: true}
+			}
+			if kind == "response.completed" || kind == "response.incomplete" {
+				return streamFrameClass{invalid: true}
 			}
 			return streamFrameClass{}
 		}
@@ -421,7 +468,16 @@ func classifyResponsesFrame(event upstream.SSEEvent) streamFrameClass {
 		return streamFrameClass{semantic: true}
 
 	case "response.completed", "response.incomplete":
-		return streamFrameClass{semantic: true, completed: true, terminal: true}
+		response := payload.Response
+		if payload.Type != kind || response == nil || response.ID == "" || response.Object != "response" ||
+			response.Status != strings.TrimPrefix(kind, "response.") || jsonValueNonEmpty(response.Error) {
+			return streamFrameClass{invalid: true}
+		}
+		var output []json.RawMessage
+		if len(response.Output) == 0 || bytes.Equal(bytes.TrimSpace(response.Output), []byte("null")) || json.Unmarshal(response.Output, &output) != nil {
+			return streamFrameClass{invalid: true}
+		}
+		return streamFrameClass{semantic: true, completed: true, terminal: true, incomplete: kind == "response.incomplete"}
 
 	default:
 		return streamFrameClass{}
@@ -528,17 +584,17 @@ type streamAttemptResult struct {
 
 // streamAttemptRuntime 是一次流式尝试所需的请求上下文。
 type streamAttemptRuntime struct {
-	ctx       context.Context
-	cancel    context.CancelFunc
-	w         http.ResponseWriter
-	flusher   http.Flusher
-	requestID string
-	index     int
-	candidate routing.Candidate
-	body      []byte
-	headers   http.Header
-	info      RequestInfo
-	requestAt time.Time
+	ctx         context.Context
+	cancel      context.CancelFunc
+	w           http.ResponseWriter
+	firstBudget *firstContentBudget
+	requestID   string
+	index       int
+	candidate   routing.Candidate
+	body        []byte
+	headers     http.Header
+	info        RequestInfo
+	requestAt   time.Time
 }
 
 // ServeHTTP 执行流式失败切换。
@@ -552,11 +608,6 @@ func (s *StreamProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	info, ok := RequestInfoFromContext(r.Context())
-	if !ok {
-		writeInternalError(w)
-		return
-	}
-	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeInternalError(w)
 		return
@@ -575,21 +626,26 @@ func (s *StreamProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	requestAt := s.now()
 	requestID := s.requestID(r)
-	ctx, cancel := context.WithCancel(r.Context())
+	requestCtx, cancel := context.WithTimeout(r.Context(), s.requestTimeout)
 	defer cancel()
+	ctx, firstBudget := startFirstContentBudget(requestCtx, s.firstContentTimeout)
+	defer firstBudget.close()
 
-	attempts := make([]observability.RequestAttempt, 0, maxUpstreamAttempts)
-	excluded := make(map[int64]struct{}, maxUpstreamAttempts)
+	attempts := make([]observability.RequestAttempt, 0, s.maxAttempts)
+	excluded := make(map[int64]struct{}, s.maxAttempts)
 	var lastFailure *proxyFailure
 	var lastTTFT *int64
 	var responseBytes *int64
 
-	for len(attempts) < maxUpstreamAttempts {
-		if err := r.Context().Err(); err != nil {
-			failure := classifyUpstreamError(err)
+	for len(attempts) < s.maxAttempts {
+		if err := ctx.Err(); err != nil {
+			failure := requestFailure(ctx, err)
 			httpStatus := failure.Status
+			if !failure.Canceled {
+				writeFailure(w, failure, s.writeTimeout)
+			}
 			s.recordStreamRequest(requestID, info, attempts,
-				observability.StatusCancelled, &httpStatus, &failure,
+				attemptStatus(failure), &httpStatus, &failure,
 				false, nil, lastTTFT, requestAt)
 			return
 		}
@@ -598,14 +654,17 @@ func (s *StreamProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			ctx, info.Model, info.Protocol, excluded)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				failure := classifyUpstreamError(err)
+				failure := requestFailure(ctx, err)
 				status := failure.Status
 				if failure.Canceled {
 					status = httpStatusClientClosedRequest
 					failure.Status = status
 				}
+				if !failure.Canceled {
+					writeFailure(w, failure, s.writeTimeout)
+				}
 				s.recordStreamRequest(requestID, info, attempts,
-					observability.StatusCancelled, &status, &failure,
+					attemptStatus(failure), &status, &failure,
 					false, responseBytes, lastTTFT, requestAt)
 				return
 			}
@@ -613,7 +672,7 @@ func (s *StreamProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			failure := schedulingFailure(err)
-			writeFailure(w, failure)
+			writeFailure(w, failure, s.writeTimeout)
 			s.recordStreamRequest(requestID, info, attempts,
 				observability.StatusError, &failure.Status, &failure,
 				false, nil, nil, requestAt)
@@ -621,17 +680,17 @@ func (s *StreamProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		result := s.runStreamAttempt(streamAttemptRuntime{
-			ctx:       ctx,
-			cancel:    cancel,
-			w:         w,
-			flusher:   flusher,
-			requestID: requestID,
-			index:     len(attempts) + 1,
-			candidate: candidate,
-			body:      body,
-			headers:   r.Header,
-			info:      info,
-			requestAt: requestAt,
+			ctx:         ctx,
+			cancel:      cancel,
+			w:           w,
+			firstBudget: firstBudget,
+			requestID:   requestID,
+			index:       len(attempts) + 1,
+			candidate:   candidate,
+			body:        body,
+			headers:     r.Header,
+			info:        info,
+			requestAt:   requestAt,
 		}, slot)
 		attempts = append(attempts, result.record)
 		s.writeAttempt(result.record)
@@ -693,7 +752,7 @@ func (s *StreamProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		failure := schedulingFailure(routing.ErrNoCandidates)
 		lastFailure = &failure
 	}
-	writeFailure(w, *lastFailure)
+	writeFailure(w, *lastFailure, s.writeTimeout)
 	s.recordStreamRequest(requestID, info, attempts,
 		observability.StatusError, &lastFailure.Status, lastFailure,
 		false, nil, lastTTFT, requestAt)
@@ -713,6 +772,7 @@ func (s *StreamProxy) runStreamAttempt(
 	key, err := s.decryptKey(rt.candidate.Channel.KeyCiphertext)
 	if err != nil || strings.TrimSpace(key) == "" {
 		failure := upstreamConfigurationFailure()
+		s.scheduler.RecordFailure(rt.candidate, failure.routingFailure(0))
 		return s.streamFailureResult(rt, attemptStarted, nil, &failure, false, 0, nil)
 	}
 
@@ -729,9 +789,9 @@ func (s *StreamProxy) runStreamAttempt(
 		Stream:        true,
 	})
 	if err != nil {
-		failure := classifyUpstreamError(err)
+		failure := requestFailure(rt.ctx, err)
 		if !failure.Canceled {
-			s.scheduler.RecordFailure(rt.candidate.Channel.ID, 0, failure.Message)
+			s.scheduler.RecordFailure(rt.candidate, failure.routingFailure(0))
 		}
 		return s.streamFailureResult(rt, attemptStarted, nil, &failure, false, 0, nil)
 	}
@@ -751,34 +811,60 @@ func (s *StreamProxy) runStreamAttempt(
 
 	upstreamStatus := response.StatusCode
 	if upstreamStatus < http.StatusOK || upstreamStatus >= http.StatusMultipleChoices {
+		failure := classifyHTTPFailure(response, s.now())
 		_ = response.Body.Close()
-		failure := classifyUpstreamStatus(upstreamStatus)
-		if retryAfter := strings.TrimSpace(response.Header.Get("Retry-After")); retryAfter != "" {
-			failure.RetryAfter = retryAfter
+		if rt.ctx.Err() != nil {
+			failure = requestFailure(rt.ctx, rt.ctx.Err())
 		}
-		s.scheduler.RecordFailure(rt.candidate.Channel.ID, upstreamStatus, failure.Message)
+		if !failure.Canceled {
+			s.scheduler.RecordFailure(rt.candidate, failure.routingFailure(upstreamStatus))
+		}
 		return s.streamFailureResult(rt, attemptStarted, &upstreamStatus, &failure, false, 0, nil)
 	}
 	defer response.Body.Close()
 	httpStatus := upstreamStatus
 
+	// 请求了 stream 但上游返回 JSON（例如某些兼容层忽略 stream=true）时，
+	// 不能把它当成空 SSE：先有界读取并丢弃 body，再按可重试的上游错误处理，
+	// 由失败切换选择下一个渠道。
+	if contentType := strings.TrimSpace(response.Header.Get("Content-Type")); contentType != "" {
+		if mediaType, _, parseErr := mime.ParseMediaType(contentType); parseErr != nil ||
+			!strings.EqualFold(mediaType, "text/event-stream") {
+			_, _ = io.CopyN(io.Discard, response.Body, maxNonSSEBodyBytes)
+			if rt.ctx.Err() != nil {
+				failure := requestFailure(rt.ctx, rt.ctx.Err())
+				return s.streamFailureResult(rt, attemptStarted, &httpStatus, &failure, false, 0, nil)
+			}
+			failure := proxyFailure{
+				Status:  http.StatusBadGateway,
+				Code:    errorCodeUpstreamError,
+				Type:    errorTypeServer,
+				Message: "Upstream returned a non-streaming response.",
+				Retry:   true,
+			}
+			s.scheduler.RecordFailure(rt.candidate, failure.routingFailure(upstreamStatus))
+			return s.streamFailureResult(rt, attemptStarted, &upstreamStatus, &failure, false, 0, nil)
+		}
+	}
+
 	reader := upstream.NewSSEReader(response.Body, upstream.SSEReaderOptions{})
 	defer reader.Close()
 	gate := &streamGate{
-		protocol:  rt.info.Protocol,
-		info:      rt.info,
-		requestID: rt.requestID,
-		w:         rt.w,
-		flusher:   rt.flusher,
-		maxBuffer: s.maxBufferBytes,
-		requestAt: rt.requestAt,
-		now:       s.now,
+		protocol:     rt.info.Protocol,
+		info:         rt.info,
+		requestID:    rt.requestID,
+		w:            rt.w,
+		ctx:          rt.ctx,
+		writeTimeout: s.writeTimeout,
+		firstBudget:  rt.firstBudget,
+		maxBuffer:    s.maxBufferBytes,
+		requestAt:    rt.requestAt,
+		now:          s.now,
 	}
 
 	for {
 		if err := rt.ctx.Err(); err != nil {
-			failure := classifyUpstreamError(err)
-			rt.cancel()
+			failure := requestFailure(rt.ctx, err)
 			return s.streamFailureResult(rt, attemptStarted, &httpStatus,
 				&failure, gate.committed, gate.written, gate.ttftMS)
 		}
@@ -786,24 +872,25 @@ func (s *StreamProxy) runStreamAttempt(
 		event, err := reader.Next()
 		if err != nil {
 			if ctxErr := rt.ctx.Err(); ctxErr != nil {
-				failure := classifyUpstreamError(ctxErr)
+				failure := requestFailure(rt.ctx, ctxErr)
 				return s.streamFailureResult(rt, attemptStarted, &httpStatus,
 					&failure, gate.committed, gate.written, gate.ttftMS)
 			}
 			if errors.Is(err, io.EOF) {
 				if gate.completed && gate.committed {
-					s.scheduler.RecordSuccess(rt.candidate.Channel.ID)
+					s.scheduler.RecordSuccess(rt.candidate)
 					return s.streamSuccessResult(rt, attemptStarted, &httpStatus,
 						gate.written, gate.ttftMS)
 				}
 				failure := interruptedStreamFailure()
+				s.scheduler.RecordFailure(rt.candidate, failure.routingFailure(0))
 				if !gate.committed {
 					return s.streamFailureResult(rt, attemptStarted, &httpStatus,
 						&failure, false, 0, nil)
 				}
 				if writeErr := gate.emitFailure(failure); writeErr != nil {
-					return s.canceledStreamResult(rt, attemptStarted, &httpStatus,
-						gate.committed, gate.written, gate.ttftMS)
+					return s.downstreamStreamResult(rt, attemptStarted, &httpStatus,
+						gate.committed, gate.written, gate.ttftMS, writeErr)
 				}
 				return s.streamFailureResult(rt, attemptStarted, &httpStatus,
 					&failure, true, gate.written, gate.ttftMS)
@@ -811,20 +898,21 @@ func (s *StreamProxy) runStreamAttempt(
 
 			failure := streamReadFailure(err)
 			if ctxErr := rt.ctx.Err(); ctxErr != nil {
-				failure = classifyUpstreamError(ctxErr)
+				failure = requestFailure(rt.ctx, ctxErr)
 			}
 			if failure.Canceled {
 				// 客户端断开：不再写终止事件，也不再重试。
 				return s.streamFailureResult(rt, attemptStarted, &httpStatus,
 					&failure, gate.committed, gate.written, gate.ttftMS)
 			}
+			s.scheduler.RecordFailure(rt.candidate, failure.routingFailure(0))
 			if !gate.committed {
 				return s.streamFailureResult(rt, attemptStarted, &httpStatus,
 					&failure, false, 0, nil)
 			}
 			if writeErr := gate.emitFailure(failure); writeErr != nil {
-				return s.canceledStreamResult(rt, attemptStarted, &httpStatus,
-					gate.committed, gate.written, gate.ttftMS)
+				return s.downstreamStreamResult(rt, attemptStarted, &httpStatus,
+					gate.committed, gate.written, gate.ttftMS, writeErr)
 			}
 			return s.streamFailureResult(rt, attemptStarted, &httpStatus,
 				&failure, true, gate.written, gate.ttftMS)
@@ -833,15 +921,19 @@ func (s *StreamProxy) runStreamAttempt(
 		gate.observe(event)
 		class := classifyStreamFrame(rt.info.Protocol, event)
 
-		if class.failure {
+		if class.failure || class.invalid {
 			failure := upstreamStreamFailure()
+			if class.failure {
+				failure = classifyStructuredFailure(failure, event.Data)
+			}
+			s.scheduler.RecordFailure(rt.candidate, failure.routingFailure(0))
 			if !gate.committed {
 				return s.streamFailureResult(rt, attemptStarted, &httpStatus,
 					&failure, false, 0, nil)
 			}
 			if writeErr := gate.emitFailure(failure); writeErr != nil {
-				return s.canceledStreamResult(rt, attemptStarted, &httpStatus,
-					gate.committed, gate.written, gate.ttftMS)
+				return s.downstreamStreamResult(rt, attemptStarted, &httpStatus,
+					gate.committed, gate.written, gate.ttftMS, writeErr)
 			}
 			return s.streamFailureResult(rt, attemptStarted, &httpStatus,
 				&failure, true, gate.written, gate.ttftMS)
@@ -849,27 +941,31 @@ func (s *StreamProxy) runStreamAttempt(
 
 		if class.semantic || class.terminal {
 			if err := gate.commit(event.Raw); err != nil {
-				rt.cancel()
-				return s.canceledStreamResult(rt, attemptStarted, &httpStatus,
-					gate.committed, gate.written, gate.ttftMS)
+				return s.downstreamStreamResult(rt, attemptStarted, &httpStatus,
+					gate.committed, gate.written, gate.ttftMS, err)
 			}
 		} else if !gate.committed {
 			if err := gate.buffer(event.Raw); err != nil {
 				failure := streamBufferLimitFailure()
+				s.scheduler.RecordFailure(rt.candidate, failure.routingFailure(0))
 				return s.streamFailureResult(rt, attemptStarted, &httpStatus,
 					&failure, false, 0, nil)
 			}
 		} else if err := gate.write(event.Raw); err != nil {
-			rt.cancel()
-			return s.canceledStreamResult(rt, attemptStarted, &httpStatus,
-				gate.committed, gate.written, gate.ttftMS)
+			return s.downstreamStreamResult(rt, attemptStarted, &httpStatus,
+				gate.committed, gate.written, gate.ttftMS, err)
 		}
 
 		if class.completed {
 			gate.completed = true
 		}
 		if class.terminal {
-			s.scheduler.RecordSuccess(rt.candidate.Channel.ID)
+			if class.incomplete {
+				failure := proxyFailure{Status: http.StatusOK, Code: "upstream_incomplete", Type: errorTypeServer, Message: "Upstream returned an incomplete response.", Scope: routing.FailureScopeRequest}
+				s.scheduler.RecordFailure(rt.candidate, failure.routingFailure(upstreamStatus))
+				return s.streamFailureResult(rt, attemptStarted, &httpStatus, &failure, true, gate.written, gate.ttftMS)
+			}
+			s.scheduler.RecordSuccess(rt.candidate)
 			return s.streamSuccessResult(rt, attemptStarted, &httpStatus,
 				gate.written, gate.ttftMS)
 		}
@@ -922,24 +1018,26 @@ func (s *StreamProxy) streamSuccessResult(
 	}
 }
 
-// canceledStreamResult 构造客户端断开结果；canceled=true 阻止重试。
-func (s *StreamProxy) canceledStreamResult(
+// downstreamStreamResult 保留真实取消与写失败的区别；两者均不重试。
+func (s *StreamProxy) downstreamStreamResult(
 	rt streamAttemptRuntime,
 	started time.Time,
 	httpStatus *int,
 	committed bool,
 	written int64,
 	ttftMS *int64,
+	err error,
 ) streamAttemptResult {
-	failure := classifyUpstreamError(context.Canceled)
+	failure := downstreamFailure(rt.ctx, err)
+	rt.cancel()
 	record := newAttemptRecord(rt.requestID, rt.index, rt.candidate,
-		observability.StatusCancelled, httpStatus, &failure,
+		attemptStatus(failure), httpStatus, &failure,
 		committed, started, s.now())
 	return streamAttemptResult{
 		record:    record,
 		failure:   &failure,
 		committed: committed,
-		canceled:  true,
+		canceled:  failure.Canceled,
 		bytes:     written,
 		ttftMS:    ttftMS,
 	}
@@ -984,6 +1082,8 @@ func streamReadFailure(err error) proxyFailure {
 	case errors.Is(err, upstream.ErrSSEIdleTimeout),
 		errors.Is(err, upstream.ErrStreamIdleTimeout):
 		return classifyUpstreamError(upstream.ErrStreamIdleTimeout)
+	case errors.Is(err, upstream.ErrSSETruncatedEvent):
+		return interruptedStreamFailure()
 	case errors.Is(err, upstream.ErrSSEEventTooLarge):
 		return proxyFailure{
 			Status:  http.StatusBadGateway,

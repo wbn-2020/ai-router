@@ -245,7 +245,7 @@ func (s *proxyTestStack) do(t *testing.T, path, body string) *httptest.ResponseR
 	req.Header.Set("Authorization", "Bearer "+proxyTestClientKey)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
-	s.handler.ServeHTTP(rec, req)
+	s.handler.ServeHTTP(&deadlineRecorder{ResponseRecorder: rec}, req)
 	return rec
 }
 
@@ -816,5 +816,65 @@ func TestProxyCapacityExhaustedMapsTo429(t *testing.T) {
 	}
 	if len(detail.Attempts) != 0 {
 		t.Fatalf("容量耗尽不应有 attempt，实际 %d 条", len(detail.Attempts))
+	}
+}
+
+// TestProxySuccessForcesNoStoreAndIgnoresUpstreamRequestID 覆盖 C10/C5：
+// 数据面成功响应必须禁止缓存，且不能把上游 X-Request-ID 透传给客户端。
+func TestProxySuccessForcesNoStoreAndIgnoresUpstreamRequestID(t *testing.T) {
+	stack := newProxyTestStack(t, proxyStackOptions{})
+	fake := newProxyFakeUpstream(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Header().Set("Pragma", "cache")
+		w.Header().Set("X-Request-Id", "upstream-request-id")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"id":"resp_ok","output":[]}`)
+	})
+	channel := stack.addChannel(t, "no-store", fake.server.URL,
+		storepkg.ChannelProtocolOpenAIResponses, 1)
+	stack.addRoute(t, channel.ID, "gpt-upstream-no-store")
+
+	rec := stack.do(t, PathResponses, proxyRequestBody())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HTTP 状态 = %d，期望 200；body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q，期望 no-store", got)
+	}
+	if got := rec.Header().Get("Pragma"); got != "no-cache" {
+		t.Fatalf("Pragma = %q，期望 no-cache", got)
+	}
+	if got := rec.Header().Get("X-Request-Id"); got != "" {
+		t.Fatalf("X-Request-Id = %q，不应透传上游值", got)
+	}
+}
+
+// TestProxyCircuitOpenReturns503 覆盖 C8：全部候选熔断时返回可重试的 503，
+// 不是 404 model_not_available。
+func TestProxyCircuitOpenReturns503(t *testing.T) {
+	stack := newProxyTestStack(t, proxyStackOptions{})
+	fake := newProxyJSONUpstream(t, http.StatusOK, `{"ok":true}`)
+	channel := stack.addChannel(t, "circuit", fake.server.URL,
+		storepkg.ChannelProtocolOpenAIResponses, 1)
+	stack.addRoute(t, channel.ID, "gpt-upstream-circuit")
+	candidate, slot, err := stack.scheduler.Acquire(context.Background(), proxyTestModel, storepkg.ChannelProtocolOpenAIResponses)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer slot.Release()
+	if !stack.scheduler.RecordFailure(candidate, routing.Failure{Scope: routing.FailureScopeChannel, Status: http.StatusUnauthorized, Message: "upstream auth failed"}) {
+		t.Fatal("401 应触发熔断")
+	}
+
+	rec := stack.do(t, PathResponses, proxyRequestBody())
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("HTTP 状态 = %d，期望 503；body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != "1" {
+		t.Fatalf("Retry-After = %q，期望 1", got)
+	}
+	if got := fake.hits.Load(); got != 0 {
+		t.Fatalf("熔断时上游调用 %d 次，期望 0", got)
 	}
 }

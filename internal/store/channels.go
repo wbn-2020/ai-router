@@ -22,7 +22,9 @@ import (
 // 数据访问逻辑。
 const channelColumns = `id, name, base_url, protocol, key_ciphertext, key_mask,
 	priority, max_concurrency, enabled, last_used_at, last_health_status,
-	last_health_latency_ms, last_health_at, last_error, created_at, updated_at`
+	last_health_latency_ms, last_health_at, last_error, created_at, updated_at,
+	connection_revision, last_health_revision, last_health_model, last_health_protocol,
+	last_health_kind, last_health_duration_ms`
 
 // 渠道协议枚举与 0001 迁移中的 CHECK 约束保持一致。
 const (
@@ -92,11 +94,17 @@ type Channel struct {
 	MaxConcurrency int
 	Enabled        bool
 
-	LastUsedAt          *time.Time
-	LastHealthStatus    string
-	LastHealthLatencyMS *int
-	LastHealthAt        *time.Time
-	LastError           string
+	ConnectionRevision   int64
+	LastUsedAt           *time.Time
+	LastHealthStatus     string
+	LastHealthLatencyMS  *int
+	LastHealthAt         *time.Time
+	LastError            string
+	LastHealthRevision   int64
+	LastHealthModel      string
+	LastHealthProtocol   string
+	LastHealthKind       string
+	LastHealthDurationMS *int
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
@@ -131,10 +139,15 @@ type ChannelUpdate struct {
 
 // ChannelHealth 是连通性探针写入的健康状态。
 type ChannelHealth struct {
-	Status    string
-	LatencyMS *int
-	At        time.Time
-	Error     string
+	Status             string
+	LatencyMS          *int
+	At                 time.Time
+	Error              string
+	ConnectionRevision int64
+	Model              string
+	Protocol           string
+	Kind               string
+	DurationMS         *int
 }
 
 // Channels 提供 channels 表的 CRUD 与运行态辅助写入。
@@ -190,6 +203,159 @@ func (r *Channels) Create(ctx context.Context, in ChannelInput) (Channel, error)
 		return Channel{}, wrapChannelWriteError("创建渠道失败", err)
 	}
 	return channel, nil
+}
+
+// maxChannelModels 限制一次创建渠道时自动生成的模型映射数量。
+const maxChannelModels = 200
+
+// CreateWithModels 在同一事务中创建渠道，并为每个模型创建一条
+// client_model = upstream_model 的启用映射。
+//
+// 模型名会 trim、去重、跳过空项，并复用 ModelRouteInput 的校验规则；任一
+// 映射写入失败都会回滚渠道，避免留下“渠道存在但模型只建了一半”的状态。
+func (r *Channels) CreateWithModels(
+	ctx context.Context,
+	in ChannelInput,
+	models []string,
+) (Channel, []ModelRoute, error) {
+	if r == nil || r.db == nil {
+		return Channel{}, nil, errors.New("store: 渠道仓储未初始化")
+	}
+	config, err := normalizeChannelConfig(in.ChannelConfig)
+	if err != nil {
+		return Channel{}, nil, err
+	}
+	if strings.TrimSpace(in.KeyCiphertext) == "" || strings.TrimSpace(in.KeyMask) == "" {
+		return Channel{}, nil, invalidChannel("key_ciphertext 与 key_mask 不能为空")
+	}
+	normalizedModels, err := normalizeChannelModelNames(models)
+	if err != nil {
+		return Channel{}, nil, err
+	}
+
+	tx, err := beginChannelTx(ctx, r.db)
+	if err != nil {
+		return Channel{}, nil, err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	now := formatChannelTime(time.Now())
+	row := tx.QueryRowContext(ctx, `
+		INSERT INTO channels (
+			name, base_url, protocol, key_ciphertext, key_mask,
+			priority, max_concurrency, enabled, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		RETURNING `+channelColumns,
+		config.Name,
+		config.BaseURL,
+		config.Protocol,
+		in.KeyCiphertext,
+		in.KeyMask,
+		config.Priority,
+		config.MaxConcurrency,
+		boolToInt(config.Enabled),
+		now,
+		now,
+	)
+	channel, err := scanChannel(row)
+	if err != nil {
+		return Channel{}, nil, wrapChannelWriteError("创建渠道失败", err)
+	}
+
+	routes := make([]ModelRoute, 0, len(normalizedModels))
+	for _, model := range normalizedModels {
+		route, insertErr := insertModelRoute(ctx, tx, ModelRouteInput{
+			ClientModel:   model,
+			ChannelID:     channel.ID,
+			UpstreamModel: model,
+			Priority:      0,
+			Enabled:       true,
+		}, now)
+		if insertErr != nil {
+			return Channel{}, nil, insertErr
+		}
+		routes = append(routes, route)
+	}
+	if err := tx.Commit(); err != nil {
+		return Channel{}, nil, fmt.Errorf("store: 提交渠道创建事务失败：%w", err)
+	}
+	return channel, routes, nil
+}
+
+// beginChannelTx 通过类型断言获取事务能力，避免给 ChannelDB 测试替身增加
+// 不必要的方法；真实仓储传入的是 *sql.DB。
+func beginChannelTx(ctx context.Context, db ChannelDB) (*sql.Tx, error) {
+	beginner, ok := db.(interface {
+		BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+	})
+	if !ok {
+		return nil, errors.New("store: 渠道仓储不支持事务")
+	}
+	tx, err := beginner.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("store: 开启渠道创建事务失败：%w", err)
+	}
+	return tx, nil
+}
+
+// normalizeChannelModelNames 校验并去重一次创建的模型名。
+func normalizeChannelModelNames(models []string) ([]string, error) {
+	normalized := make([]string, 0, len(models))
+	seen := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		model = strings.TrimSpace(model)
+		if model == "" {
+			continue
+		}
+		input, err := normalizeModelRouteInput(ModelRouteInput{
+			ClientModel:   model,
+			ChannelID:     1,
+			UpstreamModel: model,
+			Priority:      0,
+			Enabled:       true,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if _, duplicate := seen[input.ClientModel]; duplicate {
+			continue
+		}
+		seen[input.ClientModel] = struct{}{}
+		normalized = append(normalized, input.ClientModel)
+	}
+	if len(normalized) > maxChannelModels {
+		return nil, invalidModelRoute(fmt.Sprintf("一次最多创建 %d 个模型", maxChannelModels))
+	}
+	return normalized, nil
+}
+
+// ValidateChannelKeys 只读验证全部渠道密文，包括停用渠道；不泄漏解密细节。
+func (s *Store) ValidateChannelKeys(ctx context.Context, decrypt func(string) (string, error)) error {
+	invalid := errors.New("store: 渠道密钥校验失败")
+	if s == nil || s.db == nil || decrypt == nil {
+		return invalid
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT key_ciphertext FROM channels`)
+	if err != nil {
+		return invalid
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var ciphertext string
+		if err := rows.Scan(&ciphertext); err != nil {
+			return invalid
+		}
+		plaintext, err := decrypt(ciphertext)
+		if err != nil || strings.TrimSpace(plaintext) == "" {
+			return invalid
+		}
+	}
+	if rows.Err() != nil {
+		return invalid
+	}
+	return nil
 }
 
 // Get 按 ID 返回渠道；不存在时返回 ErrChannelNotFound。
@@ -248,47 +414,39 @@ func (r *Channels) Update(ctx context.Context, id int64, in ChannelUpdate) (Chan
 		return Channel{}, invalidChannel("key_ciphertext 与 key_mask 必须同时提供")
 	}
 
-	now := formatChannelTime(time.Now())
-	var row *sql.Row
-	if in.KeyCiphertext == nil {
-		row = r.db.QueryRowContext(ctx, `
-			UPDATE channels SET
-				name = ?, base_url = ?, protocol = ?, priority = ?,
-				max_concurrency = ?, enabled = ?, updated_at = ?
-			WHERE id = ?
-			RETURNING `+channelColumns,
-			config.Name,
-			config.BaseURL,
-			config.Protocol,
-			config.Priority,
-			config.MaxConcurrency,
-			boolToInt(config.Enabled),
-			now,
-			id,
-		)
-	} else {
+	var ciphertext, mask any
+	if in.KeyCiphertext != nil {
 		if strings.TrimSpace(*in.KeyCiphertext) == "" || strings.TrimSpace(*in.KeyMask) == "" {
 			return Channel{}, invalidChannel("key_ciphertext 与 key_mask 不能为空")
 		}
-		row = r.db.QueryRowContext(ctx, `
-			UPDATE channels SET
-				name = ?, base_url = ?, protocol = ?, priority = ?,
-				max_concurrency = ?, enabled = ?,
-				key_ciphertext = ?, key_mask = ?, updated_at = ?
-			WHERE id = ?
-			RETURNING `+channelColumns,
-			config.Name,
-			config.BaseURL,
-			config.Protocol,
-			config.Priority,
-			config.MaxConcurrency,
-			boolToInt(config.Enabled),
-			*in.KeyCiphertext,
-			*in.KeyMask,
-			now,
-			id,
-		)
+		ciphertext, mask = *in.KeyCiphertext, *in.KeyMask
 	}
+	// 所有赋值读取同一行的旧值，连接变化与检查结果失效在一次 UPDATE 中完成。
+	row := r.db.QueryRowContext(ctx, `
+		WITH incoming(name, base_url, protocol, priority, max_concurrency, enabled, key_ciphertext, key_mask, updated_at) AS
+			(VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?))
+		UPDATE channels SET
+			connection_revision = connection_revision + CASE WHEN
+				base_url != (SELECT base_url FROM incoming) OR protocol != (SELECT protocol FROM incoming)
+				OR (SELECT key_ciphertext FROM incoming) IS NOT NULL THEN 1 ELSE 0 END,
+			last_health_status = CASE WHEN base_url = (SELECT base_url FROM incoming) AND protocol = (SELECT protocol FROM incoming) AND (SELECT key_ciphertext FROM incoming) IS NULL THEN last_health_status END,
+			last_health_latency_ms = CASE WHEN base_url = (SELECT base_url FROM incoming) AND protocol = (SELECT protocol FROM incoming) AND (SELECT key_ciphertext FROM incoming) IS NULL THEN last_health_latency_ms END,
+			last_health_at = CASE WHEN base_url = (SELECT base_url FROM incoming) AND protocol = (SELECT protocol FROM incoming) AND (SELECT key_ciphertext FROM incoming) IS NULL THEN last_health_at END,
+			last_error = CASE WHEN base_url = (SELECT base_url FROM incoming) AND protocol = (SELECT protocol FROM incoming) AND (SELECT key_ciphertext FROM incoming) IS NULL THEN last_error END,
+			last_health_revision = CASE WHEN base_url = (SELECT base_url FROM incoming) AND protocol = (SELECT protocol FROM incoming) AND (SELECT key_ciphertext FROM incoming) IS NULL THEN last_health_revision ELSE 0 END,
+			last_health_model = CASE WHEN base_url = (SELECT base_url FROM incoming) AND protocol = (SELECT protocol FROM incoming) AND (SELECT key_ciphertext FROM incoming) IS NULL THEN last_health_model ELSE '' END,
+			last_health_protocol = CASE WHEN base_url = (SELECT base_url FROM incoming) AND protocol = (SELECT protocol FROM incoming) AND (SELECT key_ciphertext FROM incoming) IS NULL THEN last_health_protocol ELSE '' END,
+			last_health_kind = CASE WHEN base_url = (SELECT base_url FROM incoming) AND protocol = (SELECT protocol FROM incoming) AND (SELECT key_ciphertext FROM incoming) IS NULL THEN last_health_kind ELSE '' END,
+			last_health_duration_ms = CASE WHEN base_url = (SELECT base_url FROM incoming) AND protocol = (SELECT protocol FROM incoming) AND (SELECT key_ciphertext FROM incoming) IS NULL THEN last_health_duration_ms END,
+			name = (SELECT name FROM incoming), base_url = (SELECT base_url FROM incoming),
+			protocol = (SELECT protocol FROM incoming), priority = (SELECT priority FROM incoming),
+			max_concurrency = (SELECT max_concurrency FROM incoming), enabled = (SELECT enabled FROM incoming),
+			key_ciphertext = COALESCE((SELECT key_ciphertext FROM incoming), key_ciphertext),
+			key_mask = COALESCE((SELECT key_mask FROM incoming), key_mask), updated_at = (SELECT updated_at FROM incoming)
+		WHERE id = ? RETURNING `+channelColumns,
+		config.Name, config.BaseURL, config.Protocol, config.Priority, config.MaxConcurrency,
+		boolToInt(config.Enabled), ciphertext, mask, formatChannelTime(time.Now()), id,
+	)
 
 	channel, err := scanChannel(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -351,27 +509,32 @@ func (r *Channels) UpdateHealth(ctx context.Context, id int64, health ChannelHea
 	if r == nil || r.db == nil {
 		return errors.New("store: 渠道仓储未初始化")
 	}
-	var latency any
-	if health.LatencyMS != nil {
-		latency = *health.LatencyMS
-	}
 	result, err := r.db.ExecContext(ctx, `
 		UPDATE channels SET
-			last_health_status = ?,
-			last_health_latency_ms = ?,
-			last_health_at = ?,
-			last_error = ?
-		WHERE id = ?`,
-		strings.TrimSpace(health.Status),
-		latency,
-		formatChannelTime(health.At),
-		health.Error,
-		id,
+			last_health_status = ?, last_health_latency_ms = ?, last_health_at = ?, last_error = ?,
+			last_health_revision = ?, last_health_model = ?, last_health_protocol = ?,
+			last_health_kind = ?, last_health_duration_ms = ?
+		WHERE id = ? AND connection_revision = ?`,
+		strings.TrimSpace(health.Status), health.LatencyMS, formatChannelTime(health.At), health.Error,
+		health.ConnectionRevision, health.Model, health.Protocol, health.Kind, health.DurationMS,
+		id, health.ConnectionRevision,
 	)
 	if err != nil {
 		return fmt.Errorf("store: 更新渠道健康状态失败：%w", err)
 	}
-	return ensureChannelAffected(result)
+	if err := ensureChannelAffected(result); !errors.Is(err, ErrChannelNotFound) {
+		return err
+	}
+	// 旧代次探针晚到不属于写入失败；仍保留不存在渠道的错误契约。
+	var exists int
+	err = r.db.QueryRowContext(ctx, `SELECT 1 FROM channels WHERE id = ?`, id).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrChannelNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("store: 检查渠道健康状态失败：%w", err)
+	}
+	return nil
 }
 
 // TouchLastUsed 用一次短 UPDATE 记录渠道最近被调度的时间。
@@ -501,6 +664,7 @@ func scanChannel(scanner channelScanner) (Channel, error) {
 		lastUsedAt       sql.NullString
 		lastHealthStatus sql.NullString
 		latency          sql.NullInt64
+		duration         sql.NullInt64
 		lastHealthAt     sql.NullString
 		lastError        sql.NullString
 		createdAt        string
@@ -523,6 +687,12 @@ func scanChannel(scanner channelScanner) (Channel, error) {
 		&lastError,
 		&createdAt,
 		&updatedAt,
+		&channel.ConnectionRevision,
+		&channel.LastHealthRevision,
+		&channel.LastHealthModel,
+		&channel.LastHealthProtocol,
+		&channel.LastHealthKind,
+		&duration,
 	); err != nil {
 		return Channel{}, err
 	}
@@ -533,6 +703,10 @@ func scanChannel(scanner channelScanner) (Channel, error) {
 	if latency.Valid {
 		value := int(latency.Int64)
 		channel.LastHealthLatencyMS = &value
+	}
+	if duration.Valid {
+		value := int(duration.Int64)
+		channel.LastHealthDurationMS = &value
 	}
 	if lastUsedAt.Valid && lastUsedAt.String != "" {
 		parsed, err := time.Parse(channelTimeLayout, lastUsedAt.String)

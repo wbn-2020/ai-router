@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"ai-router/internal/observability"
+	"ai-router/internal/requestid"
 	storepkg "ai-router/internal/store"
 )
 
@@ -38,7 +39,7 @@ func doObserved(
 	req.Header.Set("Authorization", "Bearer "+proxyTestClientKey)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
-	observed.ServeHTTP(rec, req)
+	observed.ServeHTTP(&deadlineRecorder{ResponseRecorder: rec}, req)
 	return rec
 }
 
@@ -418,7 +419,7 @@ func TestObservedClientCancelRecords499(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 
 	recorder := httptest.NewRecorder()
-	writer := newNotifyingWriter(recorder)
+	writer := newNotifyingWriter(&deadlineRecorder{ResponseRecorder: recorder})
 	done := make(chan struct{})
 	go func() {
 		observed.ServeHTTP(writer, req)
@@ -490,5 +491,40 @@ func TestObservedGatewayDoesNotRewriteResponseBody(t *testing.T) {
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil || len(raw.Usage) == 0 {
 		t.Fatalf("客户端响应缺少 usage：%v", err)
+	}
+}
+
+// TestObservedGatewayUsesServerRequestIDForRejectedRequests 覆盖 C5/C6：
+// 路由层 401 没有进入代理，也必须用 server 生成的 request_id 写一条失败日志。
+func TestObservedGatewayUsesServerRequestIDForRejectedRequests(t *testing.T) {
+	stack := newProxyTestStack(t, proxyStackOptions{})
+	observed := newObservedGateway(t, stack)
+
+	req := httptest.NewRequest(http.MethodPost, PathResponses,
+		strings.NewReader(proxyRequestBody()))
+	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(requestid.With(req.Context(), "srv-request-id-123"))
+	rec := httptest.NewRecorder()
+	observed.ServeHTTP(&deadlineRecorder{ResponseRecorder: rec}, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("HTTP 状态 = %d，期望 401；body=%s", rec.Code, rec.Body.String())
+	}
+
+	page, err := stack.obs.ListRequests(context.Background(), observability.RequestFilter{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListRequests: %v", err)
+	}
+	if len(page.Requests) != 1 {
+		t.Fatalf("request_logs 条数 = %d，期望 1", len(page.Requests))
+	}
+	logged := page.Requests[0]
+	if logged.RequestID != "srv-request-id-123" {
+		t.Fatalf("request_id = %q，期望 server 生成的 ID", logged.RequestID)
+	}
+	if logged.Status != observability.StatusError ||
+		logged.HTTPStatus == nil || *logged.HTTPStatus != http.StatusUnauthorized ||
+		logged.ErrorCode != errorCodeInvalidAPIKey {
+		t.Fatalf("代理前失败日志错误：%+v", logged)
 	}
 }

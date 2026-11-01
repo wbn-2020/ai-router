@@ -297,6 +297,52 @@ func TestCodexManifestBackendAliasMatchesClientVersion(t *testing.T) {
 	}
 }
 
+// protocolAwareCatalog 是支持按入站协议过滤的 RouteCatalog。
+type protocolAwareCatalog struct {
+	*fakeRouteCatalog
+	byProtocol map[string][]string
+}
+
+func (c *protocolAwareCatalog) ListModelsByProtocol(
+	_ context.Context,
+	protocol string,
+) ([]string, error) {
+	return append([]string(nil), c.byProtocol[protocol]...), nil
+}
+
+// TestCodexManifestFiltersModelsByResponsesProtocol 覆盖 C8 的发现侧：
+// Codex manifest 不能列出只有 Chat 渠道的模型。
+func TestCodexManifestFiltersModelsByResponsesProtocol(t *testing.T) {
+	t.Setenv(codexContextWindowEnv, "")
+	catalog := &protocolAwareCatalog{
+		fakeRouteCatalog: &fakeRouteCatalog{models: []string{"chat-only", "shared"}},
+		byProtocol: map[string][]string{
+			store.ChannelProtocolOpenAIResponses: {"shared"},
+		},
+	}
+	handler := newCodexTestHandler(t, catalog, 0)
+
+	manifest := performRequest(handler, http.MethodGet, PathCodexModels, "", bearerHeaders())
+	if manifest.Code != http.StatusOK {
+		t.Fatalf("manifest 状态码 = %d, want 200（body=%s）", manifest.Code, manifest.Body.String())
+	}
+	models := decodeRawCodexModels(t, manifest.Body.Bytes())
+	if len(models) != 1 {
+		t.Fatalf("manifest 模型数 = %d, want 1", len(models))
+	}
+	if got := decodeRawString(t, models[0]["slug"]); got != "shared" {
+		t.Fatalf("manifest slug = %q, want shared", got)
+	}
+
+	list := performRequest(handler, http.MethodGet, PathModels, "", bearerHeaders())
+	if list.Code != http.StatusOK {
+		t.Fatalf("/v1/models 状态码 = %d, want 200", list.Code)
+	}
+	if !strings.Contains(list.Body.String(), `"chat-only"`) {
+		t.Fatalf("/v1/models 仍应列出 chat-only：%s", list.Body.String())
+	}
+}
+
 func TestCodexManifestPlainListShape(t *testing.T) {
 	handler := newCodexTestHandler(t, &fakeRouteCatalog{
 		models: []string{"gpt-5", "o3"},

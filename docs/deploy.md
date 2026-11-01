@@ -57,7 +57,10 @@ export GATEWAY_ADMIN_PASSWORD='至少 12 个字符的初始密码'
 启动后可以从环境变量中移除该密码。
 
 启动时会自动执行数据库迁移。缺少主密钥、缺少客户端 Key、监听地址非法、迁移失败
-都会导致进程以非零状态退出，而不是带着未知配置继续服务。
+都会导致进程以非零状态退出，而不是带着未知配置继续服务。提供 HTTP 服务前还会只读验证
+全部现有渠道（含停用渠道）的密文可解密；失败报告“加密状态不可读”并停止启动。
+该错误可能来自密钥不匹配或密文损坏，不会自动删除、重加密或修复数据。空库可正常初始化；
+此检查不代表对历史捕获及备份完成了全库密钥审计。
 
 ## 3. 环境变量
 
@@ -77,11 +80,27 @@ export GATEWAY_ADMIN_PASSWORD='至少 12 个字符的初始密码'
 | `GATEWAY_UPSTREAM_TLS_TIMEOUT` | `10s` | 上游 TLS 握手超时。 |
 | `GATEWAY_UPSTREAM_HEADER_TIMEOUT` | `180s` | 等待上游响应头的超时。 |
 | `GATEWAY_UPSTREAM_STREAM_IDLE_TIMEOUT` | `300s` | 流式读取空闲超时。 |
-| `GATEWAY_UPSTREAM_TIMEOUT` | `300s` | 非流式请求总超时。 |
-| `GATEWAY_UPSTREAM_STREAM_TIMEOUT` | `15m` | 流式请求总超时。 |
+| `GATEWAY_UPSTREAM_TIMEOUT` | `300s` | 每次非流式上游尝试的上限。 |
+| `GATEWAY_UPSTREAM_STREAM_TIMEOUT` | `15m` | 每次流式上游尝试的上限。 |
+| `GATEWAY_REQUEST_TIMEOUT` | 继承 `GATEWAY_UPSTREAM_TIMEOUT` | 非流式转发总预算，包含候选等待和所有尝试。 |
+| `GATEWAY_STREAM_TIMEOUT` | 继承 `GATEWAY_UPSTREAM_STREAM_TIMEOUT` | 流式转发总预算，包含候选等待和所有尝试。 |
+| `GATEWAY_FIRST_CONTENT_TIMEOUT` | `180s` | 流式首有效语义输出预算；心跳不刷新，提交后撤除。 |
+| `GATEWAY_DOWNSTREAM_WRITE_TIMEOUT` | `30s` | 每次下游写出/Flush的可续期上限，同时受转发总预算约束。 |
+| `GATEWAY_PROBE_TIMEOUT` | `60s` | 管理端指定模型的单次生成检查总预算。 |
+| `GATEWAY_MODEL_DISCOVERY_TIMEOUT` | `30s` | 管理端模型发现总预算。 |
 | `GATEWAY_MAX_ATTEMPTS` | `3` | 单次请求最多尝试的渠道数，取值 1-3。 |
 | `GATEWAY_CAPACITY_WAIT` | `2s` | 全部候选渠道满载时的最长等待；`0` 表示不等待。 |
-| `GATEWAY_CAPTURE_MAX_BYTES` | `8388608` | 单次按需 body 捕获上限（8 MiB）。 |
+| `GATEWAY_CAPTURE_MAX_BYTES` | `8388608` | 单侧（请求或响应）诊断捕获上限，8 MiB；诊断环总上限仍为 32 MiB。 |
+
+总预算从进入转发编排开始计算，不包含入站请求体上传。上游子超时与总预算同时生效，以先到者为准；客户端更短的截止也优先。成功响应及已提交流的写截止不超过总预算。尚未提交时，预算耗尽后的固定错误JSON最多使用额外 `min(1s, GATEWAY_DOWNSTREAM_WRITE_TIMEOUT)` 写窗口，不再启动上游尝试；已提交流不能改成HTTP 504或无缝切换。检查结果落库另有最多1秒的记录预算，不延长检查请求。请求完成后的日志持久化有独立有限收尾时间。
+
+### 3.1 渠道运行状态与检查
+
+- **启用状态**控制是否参与调度；**运行状态**来自当前进程的并发与熔断快照；**最近检查**是管理员显式触发的指定模型/协议生成检查。三者不互相替代。
+- 冷却结束但尚未成功恢复时显示待恢复/恢复中。仅一个生产请求可取得恢复许可，不自动发起付费后台探针；进程重启会清空运行态。
+- 模型级故障只影响对应渠道、协议和上游模型；明确请求错误及客户端取消不处罚渠道。未知错误使用保守分类，错误信息不展示原始上游正文。
+- 检查保持单次、16输出token上限。返回有效生成才显示通过；Responses incomplete或Chat length显示不确定；HTTP 200、模型列表出现、一次生成通过都不等于工具/图片/质量认证。
+- 响应头耗时与完整检查耗时分开。修改URL、协议或显式更换Key会使旧检查失效；迟到的旧版本结果不能覆盖新配置。仅改名不失效。
 
 ## 4. 数据目录与迁移
 
@@ -101,6 +120,10 @@ export GATEWAY_ADMIN_PASSWORD='至少 12 个字符的初始密码'
 启动时 `serve` 会应用内嵌迁移。迁移前使用 `VACUUM INTO` 生成
 `backups/pre-migrate-v<from>-<timestamp>.db`；每个迁移文件在独立事务中执行，
 失败会回滚当前迁移并中止启动。迁移只前进、不自动回滚。
+
+schema v2 新增连接版本和检查上下文，不改写 v1 的迁移文件。升级会清除没有版本证据的旧检查结果，
+保留渠道、Key和模型映射。若需要降回仅支持v1的二进制，应先停服，用匹配版本程序恢复升级前备份，
+再启动旧版本；不要直接让旧程序打开v2库，也不要手工删迁移记录。
 
 从 Windows 迁移到 Linux/Docker：
 
@@ -128,22 +151,23 @@ docker build -t ai-router:local .
 
 ### 5.2 运行
 
-准备环境文件（不要提交到仓库，权限设为 `0600`）：
+准备环境文件。放在仓库目录之外（例如用户配置目录），避免误提交；权限设为 `0600`：
 
 ```bash
-cat > gateway.env <<'EOF'
+mkdir -p ~/.config/ai-router
+cat > ~/.config/ai-router/gateway.env <<'EOF'
 GATEWAY_MASTER_KEY=...
 GATEWAY_CLIENT_KEY=...
 GATEWAY_ADMIN_PASSWORD=...
 GATEWAY_COOKIE_SECURE=true
 EOF
-chmod 600 gateway.env
+chmod 600 ~/.config/ai-router/gateway.env
 
 docker volume create ai-router-data
 docker run -d --name ai-router --restart unless-stopped \
   -p 127.0.0.1:8080:8080 \
   -v ai-router-data:/data \
-  --env-file gateway.env \
+  --env-file ~/.config/ai-router/gateway.env \
   ai-router:local
 ```
 
@@ -260,13 +284,13 @@ docker start ai-router
 
 恢复步骤：
 
-1. 只读打开备份，执行 `integrity_check`、核心表检查和 schema 版本兼容检查；
+1. 只读打开备份，执行 `integrity_check`、`foreign_key_check`、核心表及迁移历史校验（版本、名称、checksum、历史缺口）；
 2. 当前库存在时先生成 `backups/pre-restore-v<version>-<timestamp>.db`；
-3. 备份复制到同目录临时文件并再次校验，再原子替换；
-4. 清理旧库残留的 `gateway.db-wal` / `gateway.db-shm`。
+3. 对当前库执行 WAL checkpoint，复制备份到同目录临时文件并再次校验；
+4. 清理旧库残留的 `gateway.db-wal` / `gateway.db-shm`，再替换主数据库。
 
-任一步校验失败都不会覆盖当前数据库。手工替换文件时也必须先停进程并删除
-`-wal`/`-shm`，否则旧 WAL 可能污染恢复结果。
+预检失败不会覆盖当前数据库；checkpoint不是跨进程独占锁，整个恢复过程仍须停服。
+不要在运行时直接替换数据库或删除WAL。备份兼容不代表密钥匹配，启动时的渠道解密检查仍会执行。
 
 ## 8. 迁移失败处理
 

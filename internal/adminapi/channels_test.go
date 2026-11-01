@@ -9,8 +9,10 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"ai-router/internal/config"
+	"ai-router/internal/routing"
 	"ai-router/internal/secret"
 	"ai-router/internal/store"
 )
@@ -81,6 +83,56 @@ func assertNoChannelSecret(t *testing.T, body string, plaintext string) {
 	}
 	if strings.Contains(body, `"key"`) || strings.Contains(body, `"key_ciphertext"`) {
 		t.Fatalf("响应包含 key/key_ciphertext 字段：%s", body)
+	}
+}
+
+type fakeRuntimeReader struct {
+	seen     []store.Channel
+	snapshot routing.RuntimeSnapshot
+}
+
+func (f *fakeRuntimeReader) Runtime(channel store.Channel) routing.RuntimeSnapshot {
+	f.seen = append(f.seen, channel)
+	return f.snapshot
+}
+
+func TestChannelRuntimeIsReadOnlyAndIndependentFromHealth(t *testing.T) {
+	api, st, _, cookie, _ := newChannelsAPI(t)
+	created := createChannel(t, api, cookie, validChannelBody("runtime"))
+	if created.Runtime.State != "unknown" || created.ConnectionRevision < 1 {
+		t.Fatalf("no runtime must be unknown: %+v", created)
+	}
+	until := time.Now().UTC().Add(time.Minute)
+	reader := &fakeRuntimeReader{snapshot: routing.RuntimeSnapshot{
+		State: "recovering", InUse: 1, Limit: 3, OpenUntil: &until,
+		LastError: "upstream_timeout", ModelCooldowns: 2, ModelRecovering: 1,
+	}}
+	api.runtime = reader
+	for _, path := range []string{"/admin/api/channels", "/admin/api/channels/" + intString(created.ID)} {
+		rec := apiRequest(t, api, http.MethodGet, path, nil, "", cookie)
+		if rec.Code != http.StatusOK {
+			t.Fatal(rec.Body.String())
+		}
+		var view channelView
+		if path == "/admin/api/channels" {
+			view = decodeBody[channelListResponse](t, rec).Channels[0]
+		} else {
+			view = decodeBody[channelView](t, rec)
+		}
+		if !view.Enabled || view.LastHealthStatus != "" || view.Runtime.State != "recovering" || view.Runtime.InUse != 1 || view.Runtime.Limit != 3 || view.Runtime.ModelCooldowns != 2 || view.Runtime.ModelRecovering != 1 || view.Runtime.OpenUntil == nil || view.Runtime.LastError != "upstream_timeout" {
+			t.Fatalf("runtime incorrectly merged with configuration or health: %+v", view)
+		}
+		for _, field := range []string{"connection_revision", "last_health_revision", "last_health_model", "last_health_protocol", "last_health_kind", "last_health_duration_ms", "runtime", "open_until", "model_recovering"} {
+			if !strings.Contains(rec.Body.String(), `"`+field+`"`) {
+				t.Errorf("missing JSON field %s", field)
+			}
+		}
+	}
+	if len(reader.seen) != 2 || reader.seen[0].ConnectionRevision != created.ConnectionRevision {
+		t.Fatalf("reader missing current revision: %+v", reader.seen)
+	}
+	if health := readDebugHealth(t, st, created.ID); health.Status != "" || health.At != nil {
+		t.Fatalf("runtime read persisted health: %+v", health)
 	}
 }
 

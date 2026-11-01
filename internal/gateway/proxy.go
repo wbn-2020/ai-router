@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	"ai-router/internal/config"
 	"ai-router/internal/observability"
 	"ai-router/internal/routing"
 	"ai-router/internal/upstream"
@@ -46,8 +47,8 @@ type CandidateScheduler interface {
 		clientModel, protocol string,
 		exclude map[int64]struct{},
 	) (routing.Candidate, *routing.Slot, error)
-	RecordSuccess(channelID int64)
-	RecordFailure(channelID int64, status int, message string) bool
+	RecordSuccess(candidate routing.Candidate)
+	RecordFailure(candidate routing.Candidate, failure routing.Failure) bool
 }
 
 // UpstreamSender 是原生上游发送能力；*upstream.Client 满足。
@@ -83,6 +84,11 @@ type ProxyOptions struct {
 	// 绝不把 SSE 当作非流式 JSON 处理。
 	StreamHandler http.Handler
 
+	// MaxAttempts 是单次请求最多尝试的不同渠道数；<= 0 时使用默认值 3。
+	MaxAttempts    int
+	RequestTimeout time.Duration
+	WriteTimeout   time.Duration
+
 	Logger *slog.Logger
 	// Clock 为零时使用 time.Now。
 	Clock func() time.Time
@@ -92,14 +98,17 @@ type ProxyOptions struct {
 
 // Proxy 是非流式数据面代理。构造后字段不可变，可并发使用。
 type Proxy struct {
-	scheduler     CandidateScheduler
-	upstream      UpstreamSender
-	journal       AttemptJournal
-	decryptKey    func(string) (string, error)
-	streamHandler http.Handler
-	logger        *slog.Logger
-	now           func() time.Time
-	newRequestID  func(*http.Request) string
+	scheduler      CandidateScheduler
+	upstream       UpstreamSender
+	journal        AttemptJournal
+	decryptKey     func(string) (string, error)
+	streamHandler  http.Handler
+	maxAttempts    int
+	requestTimeout time.Duration
+	writeTimeout   time.Duration
+	logger         *slog.Logger
+	now            func() time.Time
+	newRequestID   func(*http.Request) string
 }
 
 // NewProxy 构造非流式代理。缺少任何必要依赖时返回错误，错误不包含 Key。
@@ -127,14 +136,17 @@ func NewProxy(opts ProxyOptions) (*Proxy, error) {
 	}
 
 	return &Proxy{
-		scheduler:     opts.Scheduler,
-		upstream:      opts.Upstream,
-		journal:       opts.Journal,
-		decryptKey:    opts.DecryptKey,
-		streamHandler: opts.StreamHandler,
-		logger:        logger,
-		now:           now,
-		newRequestID:  opts.RequestID,
+		scheduler:      opts.Scheduler,
+		upstream:       opts.Upstream,
+		journal:        opts.Journal,
+		decryptKey:     opts.DecryptKey,
+		streamHandler:  opts.StreamHandler,
+		maxAttempts:    normalizeMaxAttempts(opts.MaxAttempts),
+		requestTimeout: timeoutOrDefault(opts.RequestTimeout, config.DefaultUpstreamRequestTimeout),
+		writeTimeout:   timeoutOrDefault(opts.WriteTimeout, config.DefaultDownstreamWriteTimeout),
+		logger:         logger,
+		now:            now,
+		newRequestID:   opts.RequestID,
 	}, nil
 }
 
@@ -199,16 +211,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // forward 执行非流式失败切换。
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, info RequestInfo, body []byte) {
+	ctx, cancel := context.WithTimeout(r.Context(), p.requestTimeout)
+	defer cancel()
+	r = r.WithContext(ctx)
 	startedAt := p.now()
 	requestID := p.requestID(r)
-	attempts := make([]observability.RequestAttempt, 0, maxUpstreamAttempts)
-	excluded := make(map[int64]struct{}, maxUpstreamAttempts)
+	attempts := make([]observability.RequestAttempt, 0, p.maxAttempts)
+	excluded := make(map[int64]struct{}, p.maxAttempts)
 
 	var lastFailure *proxyFailure
-	for len(attempts) < maxUpstreamAttempts {
+	for len(attempts) < p.maxAttempts {
 		if err := r.Context().Err(); err != nil {
-			failure := classifyUpstreamError(err)
-			p.finishFailure(w, requestID, info, attempts, startedAt, &failure, observability.StatusCancelled)
+			failure := requestFailure(r.Context(), err)
+			p.finishFailure(w, requestID, info, attempts, startedAt, &failure, attemptStatus(failure))
 			return
 		}
 
@@ -216,8 +231,8 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, info RequestInfo
 			r.Context(), info.Model, info.Protocol, excluded)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				failure := classifyUpstreamError(err)
-				p.finishFailure(w, requestID, info, attempts, startedAt, &failure, observability.StatusCancelled)
+				failure := requestFailure(r.Context(), err)
+				p.finishFailure(w, requestID, info, attempts, startedAt, &failure, attemptStatus(failure))
 				return
 			}
 			if len(attempts) > 0 {
@@ -236,7 +251,23 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, info RequestInfo
 
 		if outcome.failure == nil && outcome.response != nil {
 			upstreamStatus := outcome.response.status
-			writeErr := writeUpstreamResponse(w, outcome.response)
+			writeErr := renewWriteDeadline(r.Context(), w, p.writeTimeout)
+			if writeErr != nil {
+				failure := downstreamFailure(r.Context(), writeErr)
+				outcome.record.Status = attemptStatus(failure)
+				outcome.record.ErrorCode = failure.Code
+				outcome.record.ErrorMessage = failure.Message
+				attempts = append(attempts, outcome.record)
+				p.writeAttempt(outcome.record)
+				p.finishFailure(w, requestID, info, attempts, startedAt, &failure, attemptStatus(failure))
+				return
+			}
+			if writeErr == nil {
+				writeErr = writeUpstreamResponse(w, outcome.response)
+			}
+			if writeErr == nil {
+				writeErr = http.NewResponseController(w).Flush()
+			}
 			committed := writeErr == nil
 
 			// 非流式请求只有完整写出后才算语义提交；写失败时不再重试。
@@ -253,17 +284,8 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, info RequestInfo
 				size := int64(len(outcome.response.body))
 				responseBytes = &size
 			} else {
-				failure := classifyUpstreamError(r.Context().Err())
-				if r.Context().Err() == nil {
-					failure = proxyFailure{
-						Status:   httpStatusClientClosedRequest,
-						Code:     errorCodeClientCanceled,
-						Type:     errorTypeInvalidRequest,
-						Message:  "Request was canceled by the client.",
-						Canceled: true,
-					}
-				}
-				status = observability.StatusCancelled
+				failure := downstreamFailure(r.Context(), writeErr)
+				status = attemptStatus(failure)
 				httpStatus = failure.Status
 				finalFailure = &failure
 				semanticCommitted = false
@@ -321,6 +343,7 @@ func (p *Proxy) runAttempt(
 	key, err := p.decryptKey(candidate.Channel.KeyCiphertext)
 	if err != nil || strings.TrimSpace(key) == "" {
 		failure := upstreamConfigurationFailure()
+		p.scheduler.RecordFailure(candidate, failure.routingFailure(0))
 		return attemptOutcome{
 			record: newAttemptRecord(requestID, index, candidate,
 				observability.StatusError, nil, &failure, false, startedAt, p.now()),
@@ -341,10 +364,10 @@ func (p *Proxy) runAttempt(
 		Stream:        false,
 	})
 	if err != nil {
-		failure := classifyUpstreamError(err)
+		failure := requestFailure(ctx, err)
 		if !failure.Canceled {
-			// 传输层错误没有上游状态码；不触发 5xx 熔断窗口。
-			p.scheduler.RecordFailure(candidate.Channel.ID, 0, failure.Message)
+			// 网关预算使用 request scope，不处罚上游渠道。
+			p.scheduler.RecordFailure(candidate, failure.routingFailure(0))
 		}
 		return attemptOutcome{
 			record: newAttemptRecord(requestID, index, candidate,
@@ -373,12 +396,12 @@ func (p *Proxy) runAttempt(
 	response.Header = upstream.FilterResponseHeaders(response.Header)
 
 	if response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices {
-		data, readErr := io.ReadAll(response.Body)
+		data, readErr := io.ReadAll(io.LimitReader(response.Body, maxNonStreamResponseBytes+1))
 		_ = response.Body.Close()
 		if readErr != nil {
-			failure := classifyUpstreamError(readErr)
+			failure := requestFailure(ctx, readErr)
 			if !failure.Canceled {
-				p.scheduler.RecordFailure(candidate.Channel.ID, 0, failure.Message)
+				p.scheduler.RecordFailure(candidate, failure.routingFailure(0))
 			}
 			return attemptOutcome{
 				record: newAttemptRecord(requestID, index, candidate,
@@ -386,8 +409,22 @@ func (p *Proxy) runAttempt(
 				failure: &failure,
 			}
 		}
+		if int64(len(data)) > maxNonStreamResponseBytes {
+			failure := proxyFailure{
+				Status:  http.StatusBadGateway,
+				Code:    errorCodeUpstreamError,
+				Type:    errorTypeServer,
+				Message: "Upstream response is too large.",
+			}
+			p.scheduler.RecordFailure(candidate, failure.routingFailure(0))
+			return attemptOutcome{
+				record: newAttemptRecord(requestID, index, candidate,
+					observability.StatusError, nil, &failure, false, startedAt, p.now()),
+				failure: &failure,
+			}
+		}
 
-		p.scheduler.RecordSuccess(candidate.Channel.ID)
+		p.scheduler.RecordSuccess(candidate)
 		statusCode := response.StatusCode
 		record := newAttemptRecord(requestID, index, candidate,
 			observability.StatusSuccess, &statusCode, nil, false, startedAt, p.now())
@@ -401,13 +438,14 @@ func (p *Proxy) runAttempt(
 		}
 	}
 
-	// 非 2xx：不读取上游 body，避免上游错误页拖慢切换或把内容带进日志。
+	failure := classifyHTTPFailure(response, p.now())
 	_ = response.Body.Close()
-	failure := classifyUpstreamStatus(response.StatusCode)
-	if retryAfter := strings.TrimSpace(response.Header.Get("Retry-After")); retryAfter != "" {
-		failure.RetryAfter = retryAfter
+	if ctx.Err() != nil {
+		failure = requestFailure(ctx, ctx.Err())
 	}
-	p.scheduler.RecordFailure(candidate.Channel.ID, response.StatusCode, failure.Message)
+	if !failure.Canceled {
+		p.scheduler.RecordFailure(candidate, failure.routingFailure(response.StatusCode))
+	}
 	statusCode := response.StatusCode
 	return attemptOutcome{
 		record: newAttemptRecord(requestID, index, candidate,
@@ -438,7 +476,7 @@ func (p *Proxy) finishFailure(
 		empty := schedulingFailure(errors.New("gateway: 代理缺少错误结果"))
 		failure = &empty
 	}
-	writeFailure(w, *failure)
+	writeFailure(w, *failure, p.writeTimeout)
 	p.recordRequest(requestID, info, attempts, status, &failure.Status,
 		failure, false, nil, startedAt)
 }
@@ -479,12 +517,21 @@ func (p *Proxy) writeAttempt(attempt observability.RequestAttempt) {
 	}
 }
 
-// writeFailure 写出固定错误 envelope；Retry-After 只用于容量/上游限流。
-func writeFailure(w http.ResponseWriter, failure proxyFailure) {
+// 总预算结束后仅给固定错误响应一个短写窗口，不重新启动任何上游尝试。
+func writeFailure(w http.ResponseWriter, failure proxyFailure, timeout time.Duration) {
+	if failure.Canceled {
+		return
+	}
+	controller := http.NewResponseController(w)
+	window := min(timeoutOrDefault(timeout, time.Second), time.Second)
+	if err := controller.SetWriteDeadline(time.Now().Add(window)); err != nil {
+		return
+	}
 	if failure.RetryAfter != "" {
 		w.Header().Set("Retry-After", failure.RetryAfter)
 	}
 	writeAPIError(w, failure.Status, failure.apiError())
+	_ = controller.Flush()
 }
 
 // writeUpstreamResponse 把上游成功响应写回客户端。
@@ -496,10 +543,21 @@ func writeUpstreamResponse(w http.ResponseWriter, response *upstreamResponse) er
 		return errors.New("gateway: 上游响应为空")
 	}
 	for name, values := range response.header {
+		// 客户端可见的 X-Request-ID 由 server 中间件生成；上游同名头只用于
+		// 上游排障，不能覆盖网关自己的请求 ID。
+		if strings.EqualFold(name, "X-Request-Id") {
+			continue
+		}
+		// 数据面响应可能包含用户 prompt/模型输出，禁止上游把 Cache-Control
+		// 改成可缓存；统一由网关设置 no-store。
+		if strings.EqualFold(name, "Cache-Control") {
+			continue
+		}
 		for _, value := range values {
 			w.Header().Add(name, value)
 		}
 	}
+	setNoStore(w.Header())
 	if w.Header().Get("Content-Type") == "" {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	}
@@ -507,12 +565,21 @@ func writeUpstreamResponse(w http.ResponseWriter, response *upstreamResponse) er
 	if len(response.body) == 0 {
 		return nil
 	}
-	_, err := w.Write(response.body)
+	n, err := w.Write(response.body)
+	if err == nil && n != len(response.body) {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
 // readProxyBody 读取并复位请求体，保证后续流式 handler 仍能看到原始字节。
+//
+// 经过 Handler 路由的请求已经把 body 缓存在 context 中，这里直接复用，
+// 避免大 body 的第二次全量读取与复制。
 func readProxyBody(r *http.Request) ([]byte, error) {
+	if body, ok := RequestBodyFromContext(r.Context()); ok {
+		return body, nil
+	}
 	if r.Body == nil {
 		r.Body = http.NoBody
 		return []byte{}, nil

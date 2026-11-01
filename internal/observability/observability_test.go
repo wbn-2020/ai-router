@@ -2,6 +2,7 @@ package observability
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"math"
@@ -833,5 +834,52 @@ func assertFloatValue(t *testing.T, name string, got *float64, want float64) {
 	}
 	if math.Abs(*got-want) > 1e-9 {
 		t.Fatalf("%s = %v，期望 %v", name, *got, want)
+	}
+}
+
+// TestWriteLogsFallbackToNullChannelOnFKViolation 覆盖 C1：渠道在请求进行中
+// 被删除后，日志写入必须以 NULL channel_id 成功，而不是丢失整条记录。
+func TestWriteLogsFallbackToNullChannelOnFKViolation(t *testing.T) {
+	obs, st := newTestObservability(t)
+	ctx := context.Background()
+	const missingChannel int64 = 999999
+
+	log := testRequestLog("req-fk-fallback", missingChannel, "gpt-5", testBase)
+	if err := obs.WriteRequest(ctx, log); err != nil {
+		t.Fatalf("WriteRequest 应在 FK 失败后以 NULL channel_id 重试成功：%v", err)
+	}
+
+	missingChannelPtr := missingChannel
+	attempt := RequestAttempt{
+		RequestID:     "req-fk-fallback",
+		AttemptIndex:  1,
+		ChannelID:     &missingChannelPtr,
+		ChannelName:   "deleted",
+		UpstreamModel: "gpt-5",
+		Status:        StatusError,
+		ErrorCode:     "upstream_unavailable",
+		LatencyMS:     10,
+		StartedAt:     testBase,
+	}
+	if err := obs.WriteAttempt(ctx, attempt); err != nil {
+		t.Fatalf("WriteAttempt 应在 FK 失败后以 NULL channel_id 重试成功：%v", err)
+	}
+
+	var requestChannel, attemptChannel sql.NullInt64
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT channel_id FROM request_logs WHERE request_id = ?`,
+		"req-fk-fallback").Scan(&requestChannel); err != nil {
+		t.Fatalf("读取 request_logs.channel_id: %v", err)
+	}
+	if requestChannel.Valid {
+		t.Fatalf("request_logs.channel_id = %d，期望 NULL", requestChannel.Int64)
+	}
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT channel_id FROM request_attempts WHERE request_id = ?`,
+		"req-fk-fallback").Scan(&attemptChannel); err != nil {
+		t.Fatalf("读取 request_attempts.channel_id: %v", err)
+	}
+	if attemptChannel.Valid {
+		t.Fatalf("request_attempts.channel_id = %d，期望 NULL", attemptChannel.Int64)
 	}
 }

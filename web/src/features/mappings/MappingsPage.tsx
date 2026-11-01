@@ -192,6 +192,7 @@ export function MappingsPage(): ReactNode {
 
   const [modelFilter, setModelFilter] = useState('all');
   const [channelFilter, setChannelFilter] = useState('all');
+  const [expandedModels, setExpandedModels] = useState<Set<string>>(() => new Set());
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -231,7 +232,7 @@ export function MappingsPage(): ReactNode {
         setUnauthorized(true);
         return;
       }
-      setModelsError('可用客户端模型刷新失败，请重试。');
+      setModelsError('已发布客户端模型刷新失败，请重试。');
     }
   }, []);
 
@@ -453,10 +454,9 @@ export function MappingsPage(): ReactNode {
     <>
       <header className="page-header">
         <div>
-          <h2>模型映射</h2>
+          <h2>模型路由</h2>
           <p>
-            客户端模型到渠道与上游模型的显式映射，是唯一的路由来源。禁用映射或渠道不会进入候选，
-            也不会出现在模型列表与 Codex manifest 中。
+            正常添加渠道时会自动生成模型路由。这里只处理别名、多渠道分流和优先级；禁用映射或渠道不会进入候选。
           </p>
         </div>
         <div className="toolbar">
@@ -466,7 +466,7 @@ export function MappingsPage(): ReactNode {
             onClick={openCreate}
             disabled={routes === null || loading}
           >
-            新建映射
+            高级手工映射
           </button>
         </div>
       </header>
@@ -486,13 +486,13 @@ export function MappingsPage(): ReactNode {
         <section className="panel" aria-labelledby="mappings-form-title">
           <div className="panel-header">
             <h2 id="mappings-form-title">
-              {editingRoute === null ? '新建映射' : `编辑映射：${editingRoute.client_model}`}
+              {editingRoute === null ? '新建手工映射' : `编辑映射：${editingRoute.client_model}`}
             </h2>
-            <span className="badge badge--muted">手工映射</span>
+            <span className="badge badge--muted">高级 · 手工映射</span>
           </div>
           <div className="panel-body">
             <p className="muted">
-              客户端模型可输入新名称，也可从已有启用模型中选择；同一客户端模型与渠道只能有一条映射。
+              客户端模型可输入新名称，也可从已发布模型中选择；同一客户端模型与渠道只能有一条映射。
             </p>
 
             <form
@@ -717,7 +717,7 @@ export function MappingsPage(): ReactNode {
         <>
           <section className="panel" aria-labelledby="mappings-models-title">
             <div className="panel-header">
-              <h2 id="mappings-models-title">可用客户端模型</h2>
+              <h2 id="mappings-models-title">已发布客户端模型</h2>
               <span className="badge badge--muted">{availableModels.length} 个</span>
             </div>
             <div className="panel-body">
@@ -737,17 +737,22 @@ export function MappingsPage(): ReactNode {
               )}
               {availableModels.length === 0 ? (
                 <p className="muted">
-                  暂无启用的客户端模型。创建并启用映射后，模型会出现在此处，也会出现在 /v1/models
-                  与 Codex manifest 中。
+                  暂无已发布的客户端模型。映射与承载渠道均启用后才会发布到 /v1/models；
+                  Codex manifest 仅包含 Responses 协议候选。已配置路由仍保留在下方。
                 </p>
               ) : (
-                <div className="toolbar" aria-label="可用客户端模型">
-                  {availableModels.map((model) => (
-                    <span className="badge" key={model}>
-                      {model}
-                    </span>
-                  ))}
-                </div>
+                <>
+                  <p className="muted">
+                    来自模型接口的发布列表；下方仍展示所有已配置路由，包括停用映射与已删除渠道的映射。
+                  </p>
+                  <div className="toolbar" aria-label="已发布客户端模型">
+                    {availableModels.map((model) => (
+                      <span className="badge" key={model}>
+                        {model}
+                      </span>
+                    ))}
+                  </div>
+                </>
               )}
             </div>
           </section>
@@ -788,7 +793,9 @@ export function MappingsPage(): ReactNode {
                     </option>
                   ))}
                 </select>
-                <span className="badge badge--muted">{routes.length} 条映射</span>
+                <span className="badge badge--muted">
+                  {hasFilters ? `${filteredRoutes.length} / ${routes.length}` : routes.length} 条映射
+                </span>
               </div>
             </div>
 
@@ -799,8 +806,7 @@ export function MappingsPage(): ReactNode {
                 </span>
                 <h3>尚无模型映射</h3>
                 <p>
-                  手工映射是唯一的路由来源。创建映射后，启用的客户端模型才会出现在模型列表与
-                  Codex manifest 中。
+                  正常添加渠道时会自动生成模型路由。需要别名或多渠道分流时，再在这里创建映射。
                 </p>
                 <button type="button" className="button" onClick={openCreate}>
                   创建第一条映射
@@ -827,137 +833,208 @@ export function MappingsPage(): ReactNode {
                 ) : null}
               </div>
             ) : (
-              <div className="table-wrap">
-                <table>
-                  <caption className="sr-only">客户端模型映射列表，按客户端模型分组</caption>
-                  <thead>
-                    <tr>
-                      <th scope="col">客户端模型</th>
-                      <th scope="col">渠道</th>
-                      <th scope="col">上游模型</th>
-                      <th scope="col">优先级</th>
-                      <th scope="col">状态</th>
-                      <th scope="col">更新时间</th>
-                      <th scope="col">操作</th>
-                    </tr>
-                  </thead>
-                  {groups.map((group) => (
-                    <tbody key={group.clientModel}>
-                      <tr>
-                        <th scope="colgroup" colSpan={7}>
-                          <span
-                            style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}
-                          >
-                            <span>{group.clientModel}</span>
-                            <span className="badge badge--muted">
-                              {group.routes.length} 条映射
-                            </span>
-                            {group.routes.some((route) => route.enabled) ? null : (
-                              <span className="badge badge--muted">全部禁用</span>
-                            )}
+              <div className="model-group-list">
+                {groups.map((group) => {
+                  const availableRoutes = group.routes.filter(
+                    (route) => route.enabled && channelByID.get(route.channel_id)?.enabled === true,
+                  );
+                  const protocols = Array.from(new Set(
+                    availableRoutes.map((route) => channelByID.get(route.channel_id)?.protocol ?? '未知协议'),
+                  ));
+                  const carrierRoutes = Array.from(new Map(
+                    group.routes.map((route) => [route.channel_id, route]),
+                  ).values());
+                  const allDisabled = group.routes.every((route) => !route.enabled);
+                  const expanded = expandedModels.has(group.clientModel);
+
+                  return (
+                    <section key={group.clientModel} aria-label={`${group.clientModel} 模型路由`}>
+                      <details
+                        className="model-group"
+                        open={expanded}
+                        onToggle={(event) => {
+                          const open = event.currentTarget.open;
+                          setExpandedModels((current) => {
+                            if (current.has(group.clientModel) === open) {
+                              return current;
+                            }
+                            const next = new Set(current);
+                            if (open) {
+                              next.add(group.clientModel);
+                            } else {
+                              next.delete(group.clientModel);
+                            }
+                            return next;
+                          });
+                        }}
+                      >
+                        <summary className="panel-header model-group-header">
+                          <h3>{group.clientModel}</h3>
+                          <span className="badge badge--muted">已配置 {group.routes.length} 条</span>
+                          <span className={availableRoutes.length > 0 ? 'badge' : 'badge badge--muted'}>
+                            可用 {availableRoutes.length} 条
                           </span>
-                        </th>
-                      </tr>
-                      {group.routes.map((route) => {
-                        const name = channelName(route);
-                        const busy = busyID === route.id;
-                        return (
-                          <tr key={route.id}>
-                            <td>
-                              <code>{route.client_model}</code>
-                            </td>
-                            <td>{name}</td>
-                            <td>
-                              <code>{route.upstream_model}</code>
-                            </td>
-                            <td>{route.priority}</td>
-                            <td>
-                              <span
-                                className={route.enabled ? 'badge' : 'badge badge--muted'}
-                              >
-                                {route.enabled ? '启用' : '禁用'}
-                              </span>
-                            </td>
-                            <td>
-                              <TimeCell value={route.updated_at} />
-                            </td>
-                            <td>
-                              <div
-                                className="toolbar"
-                                role="group"
-                                aria-label={`映射 ${route.client_model} 到 ${name} 的操作`}
-                              >
-                                <button
-                                  type="button"
-                                  className="button button--ghost"
-                                  aria-label={`编辑映射 ${route.client_model} → ${name}`}
-                                  onClick={() => {
-                                    openEdit(route);
-                                  }}
-                                  disabled={busy || submitting}
+                          {protocols.length === 0 ? null : (
+                            <span className="badge badge--muted">可用协议：{protocols.join(' / ')}</span>
+                          )}
+                          {allDisabled ? (
+                            <span className="badge badge--muted">全部停用</span>
+                          ) : availableRoutes.length === 0 ? (
+                            <span className="badge badge--muted">无可用路由</span>
+                          ) : null}
+                          <span className="muted model-group-toggle">
+                            {expanded ? '收起映射明细' : '展开映射明细'}
+                          </span>
+                          <span className="toolbar model-group-channels" aria-label="承载渠道">
+                            {carrierRoutes.map((route) => {
+                              const channel = channelByID.get(route.channel_id);
+                              const available = route.enabled && channel?.enabled === true;
+                              return (
+                                <span
+                                  className={available ? 'badge' : 'badge badge--muted'}
+                                  key={route.channel_id}
                                 >
-                                  编辑
-                                </button>
-                                {confirmingDeleteID === route.id ? (
-                                  <>
-                                    <button
-                                      type="button"
-                                      className="button"
-                                      aria-label={`确认删除映射 ${route.client_model} → ${name}`}
-                                      onClick={() => {
-                                        void handleDelete(route);
-                                      }}
-                                      disabled={busy}
-                                    >
-                                      {busy ? '正在删除…' : '确认删除'}
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="button button--ghost"
-                                      aria-label={`取消删除映射 ${route.client_model} → ${name}`}
-                                      onClick={() => {
-                                        setConfirmingDeleteID(null);
-                                      }}
-                                      disabled={busy}
-                                    >
-                                      取消
-                                    </button>
-                                  </>
-                                ) : (
-                                  <>
-                                    <button
-                                      type="button"
-                                      className="button button--ghost"
-                                      aria-label={`${route.enabled ? '禁用' : '启用'}映射 ${route.client_model} → ${name}`}
-                                      onClick={() => {
-                                        void handleToggle(route);
-                                      }}
-                                      disabled={busy}
-                                    >
-                                      {busy ? '处理中…' : route.enabled ? '禁用' : '启用'}
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="button button--ghost"
-                                      aria-label={`删除映射 ${route.client_model} → ${name}`}
-                                      onClick={() => {
-                                        setConfirmingDeleteID(route.id);
-                                        setActionError(null);
-                                      }}
-                                      disabled={busy}
-                                    >
-                                      删除
-                                    </button>
-                                  </>
-                                )}
-                              </div>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  ))}
-                </table>
+                                  {channel === undefined
+                                    ? `已删除或未知渠道 #${route.channel_id}`
+                                    : `${channel.name} · ${channel.protocol}${channel.enabled ? '' : ' · 渠道已停用'}`}
+                                  {route.enabled ? '' : ' · 映射已停用'}
+                                </span>
+                              );
+                            })}
+                          </span>
+                        </summary>
+                        {expanded ? (
+                          <div className="table-wrap">
+                            <table>
+                              <caption className="sr-only">{group.clientModel} 的映射明细</caption>
+                              <thead>
+                                <tr>
+                                  <th scope="col">客户端模型</th>
+                                  <th scope="col">渠道</th>
+                                  <th scope="col">上游模型</th>
+                                  <th scope="col">优先级</th>
+                                  <th scope="col">状态</th>
+                                  <th scope="col">更新时间</th>
+                                  <th scope="col">操作</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {group.routes.map((route) => {
+                                  const name = channelName(route);
+                                  const channel = channelByID.get(route.channel_id);
+                                  const busy = busyID === route.id;
+                                  return (
+                                    <tr key={route.id}>
+                                      <td>
+                                        <code>{route.client_model}</code>
+                                      </td>
+                                      <td>
+                                        {name}
+                                        {channel === undefined ? (
+                                          <span className="badge badge--muted">已删除或未知渠道</span>
+                                        ) : (
+                                          <>
+                                            <span className="badge badge--muted">{channel.protocol}</span>
+                                            {channel.enabled ? null : (
+                                              <span className="badge badge--muted">渠道已停用</span>
+                                            )}
+                                          </>
+                                        )}
+                                      </td>
+                                      <td>
+                                        <code>{route.upstream_model}</code>
+                                      </td>
+                                      <td>{route.priority}</td>
+                                      <td>
+                                        <span className={route.enabled ? 'badge' : 'badge badge--muted'}>
+                                          {route.enabled ? '启用' : '禁用'}
+                                        </span>
+                                      </td>
+                                      <td>
+                                        <TimeCell value={route.updated_at} />
+                                      </td>
+                                      <td>
+                                        <div
+                                          className="toolbar"
+                                          role="group"
+                                          aria-label={`映射 ${route.client_model} 到 ${name} 的操作`}
+                                        >
+                                          <button
+                                            type="button"
+                                            className="button button--ghost"
+                                            aria-label={`编辑映射 ${route.client_model} → ${name}`}
+                                            onClick={() => {
+                                              openEdit(route);
+                                            }}
+                                            disabled={busy || submitting}
+                                          >
+                                            编辑
+                                          </button>
+                                          {confirmingDeleteID === route.id ? (
+                                            <>
+                                              <button
+                                                type="button"
+                                                className="button"
+                                                aria-label={`确认删除映射 ${route.client_model} → ${name}`}
+                                                onClick={() => {
+                                                  void handleDelete(route);
+                                                }}
+                                                disabled={busy}
+                                              >
+                                                {busy ? '正在删除…' : '确认删除'}
+                                              </button>
+                                              <button
+                                                type="button"
+                                                className="button button--ghost"
+                                                aria-label={`取消删除映射 ${route.client_model} → ${name}`}
+                                                onClick={() => {
+                                                  setConfirmingDeleteID(null);
+                                                }}
+                                                disabled={busy}
+                                              >
+                                                取消
+                                              </button>
+                                            </>
+                                          ) : (
+                                            <>
+                                              <button
+                                                type="button"
+                                                className="button button--ghost"
+                                                aria-label={`${route.enabled ? '禁用' : '启用'}映射 ${route.client_model} → ${name}`}
+                                                onClick={() => {
+                                                  void handleToggle(route);
+                                                }}
+                                                disabled={busy}
+                                              >
+                                                {busy ? '处理中…' : route.enabled ? '禁用' : '启用'}
+                                              </button>
+                                              <button
+                                                type="button"
+                                                className="button button--ghost"
+                                                aria-label={`删除映射 ${route.client_model} → ${name}`}
+                                                onClick={() => {
+                                                  setConfirmingDeleteID(route.id);
+                                                  setActionError(null);
+                                                }}
+                                                disabled={busy}
+                                              >
+                                                删除
+                                              </button>
+                                            </>
+                                          )}
+                                        </div>
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                        ) : null}
+                      </details>
+                    </section>
+                  );
+                })}
               </div>
             )}
           </section>

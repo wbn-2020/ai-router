@@ -11,13 +11,11 @@ import (
 	"time"
 
 	"ai-router/internal/config"
-	"ai-router/internal/server"
 	"ai-router/internal/store"
 )
 
-// TestMountDataPlaneServesClientRoutes 验证 serve 启动路径确实把数据面临时
-// Handler 挂到了 /v1 与 /backend-api/codex/，而不是只在包级单元测试中可用。
-func TestMountDataPlaneServesClientRoutes(t *testing.T) {
+// TestBuildServerServesClientRoutes 覆盖生产装配的鉴权及模型发现入口。
+func TestBuildServerServesClientRoutes(t *testing.T) {
 	master := make([]byte, 32)
 	for i := range master {
 		master[i] = byte(i + 1)
@@ -43,16 +41,9 @@ func TestMountDataPlaneServesClientRoutes(t *testing.T) {
 		CapacityWait:    time.Second,
 		CaptureMaxBytes: config.DefaultCaptureMaxBytes,
 	}
-	srv, err := server.New(server.Options{
-		ListenAddr:      cfg.ListenAddr,
-		Store:           st,
-		MasterKeyLoaded: true,
-	})
+	srv, _, err := buildServer(cfg, st)
 	if err != nil {
-		t.Fatalf("server.New: %v", err)
-	}
-	if err := mountDataPlane(cfg, st, srv); err != nil {
-		t.Fatalf("mountDataPlane: %v", err)
+		t.Fatalf("buildServer: %v", err)
 	}
 
 	request := func(path, key string) *httptest.ResponseRecorder {

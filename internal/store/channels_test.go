@@ -254,10 +254,11 @@ func TestChannelsCRUDEncryptsKey(t *testing.T) {
 	latency := 87
 	healthAt := time.Now().UTC().Truncate(time.Second)
 	if err := repo.UpdateHealth(ctx, created.ID, ChannelHealth{
-		Status:    "healthy",
-		LatencyMS: &latency,
-		At:        healthAt,
-		Error:     "",
+		ConnectionRevision: afterTouch.ConnectionRevision,
+		Status:             "healthy",
+		LatencyMS:          &latency,
+		At:                 healthAt,
+		Error:              "",
 	}); err != nil {
 		t.Fatalf("UpdateHealth: %v", err)
 	}
@@ -484,6 +485,128 @@ func TestChannelsDeleteCascadesAndPreservesHistory(t *testing.T) {
 	}
 }
 
+func TestChannelConnectionRevisionAndHealth(t *testing.T) {
+	ctx := context.Background()
+	s := newChannelTestStore(t)
+	repo := s.Channels()
+	input := newEncryptedChannelInput(t, testChannelEnvelope(t, 0x31), "revision",
+		"https://upstream.example/v1", ChannelProtocolOpenAIResponses, "sk-revision-test", 0, 1, true)
+	channel, err := repo.Create(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if channel.ConnectionRevision != 1 {
+		t.Fatalf("initial revision = %d, want 1", channel.ConnectionRevision)
+	}
+	latency, duration := 12, 34
+	health := ChannelHealth{Status: "healthy", LatencyMS: &latency, DurationMS: &duration,
+		At: time.Now().UTC(), ConnectionRevision: 1, Model: "test-model",
+		Protocol: ChannelProtocolOpenAIResponses, Kind: "semantic"}
+	if err := repo.UpdateHealth(ctx, channel.ID, health); err != nil {
+		t.Fatal(err)
+	}
+	config := input.ChannelConfig
+	config.Name, config.Priority, config.MaxConcurrency, config.Enabled = "renamed", 3, 2, false
+	channel, err = repo.Update(ctx, channel.ID, ChannelUpdate{ChannelConfig: config})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if channel.ConnectionRevision != 1 || channel.LastHealthRevision != 1 ||
+		channel.LastHealthModel != health.Model || channel.LastHealthProtocol != health.Protocol ||
+		channel.LastHealthKind != health.Kind || channel.LastHealthDurationMS == nil ||
+		*channel.LastHealthDurationMS != duration || channel.LastHealthStatus != "healthy" {
+		t.Fatalf("non-connection update changed health metadata: %+v", channel)
+	}
+	for _, change := range []string{"url", "protocol", "key"} {
+		t.Run(change, func(t *testing.T) {
+			oldRevision := channel.ConnectionRevision
+			update := ChannelUpdate{ChannelConfig: config}
+			switch change {
+			case "url":
+				update.BaseURL = "https://changed.example/v1"
+			case "protocol":
+				update.Protocol = ChannelProtocolOpenAIChat
+			case "key":
+				// Explicitly replacing even an identical ciphertext invalidates the old probe.
+				update.KeyCiphertext, update.KeyMask = &input.KeyCiphertext, &input.KeyMask
+			}
+			channel, err = repo.Update(ctx, channel.ID, update)
+			if err != nil {
+				t.Fatal(err)
+			}
+			config = update.ChannelConfig
+			if channel.ConnectionRevision != oldRevision+1 || channel.LastHealthStatus != "" ||
+				channel.LastHealthAt != nil || channel.LastHealthLatencyMS != nil || channel.LastError != "" ||
+				channel.LastHealthRevision != 0 || channel.LastHealthModel != "" ||
+				channel.LastHealthProtocol != "" || channel.LastHealthKind != "" || channel.LastHealthDurationMS != nil {
+				t.Fatalf("connection update retained old health: %+v", channel)
+			}
+			health.ConnectionRevision = channel.ConnectionRevision
+			if err := repo.UpdateHealth(ctx, channel.ID, health); err != nil {
+				t.Fatal(err)
+			}
+			for _, staleRevision := range []int64{oldRevision, 0} {
+				stale := health
+				stale.ConnectionRevision, stale.Status, stale.Error = staleRevision, "unhealthy", "stale"
+				if err := repo.UpdateHealth(ctx, channel.ID, stale); err != nil {
+					t.Fatalf("stale health should be ignored: %v", err)
+				}
+			}
+			current, err := repo.Get(ctx, channel.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current.LastHealthStatus != "healthy" || current.LastError != "" || current.LastHealthRevision != channel.ConnectionRevision {
+				t.Fatalf("stale probe overwrote current health: %+v", current)
+			}
+		})
+	}
+}
+
+func TestValidateChannelKeysReadOnly(t *testing.T) {
+	ctx := context.Background()
+	s := newChannelTestStore(t)
+	envelope := testChannelEnvelope(t, 0x42)
+	decrypt := func(value string) (string, error) {
+		return envelope.DecryptString(value, secret.PurposeChannelKey)
+	}
+	if err := s.ValidateChannelKeys(ctx, decrypt); err != nil {
+		t.Fatalf("empty store: %v", err)
+	}
+	input := newEncryptedChannelInput(t, envelope, "disabled", "https://upstream.example/v1",
+		ChannelProtocolOpenAIResponses, "sk-key-validation-sentinel", 0, 1, false)
+	channel, err := s.Channels().Create(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ValidateChannelKeys(ctx, decrypt); err != nil {
+		t.Fatalf("valid disabled channel: %v", err)
+	}
+	wrongEnvelope := testChannelEnvelope(t, 0x43)
+	for _, decode := range []func(string) (string, error){
+		func(value string) (string, error) {
+			return wrongEnvelope.DecryptString(value, secret.PurposeChannelKey)
+		},
+		func(value string) (string, error) {
+			return "sk-key-validation-sentinel", errors.New(value + " secret-error-sentinel")
+		},
+		func(string) (string, error) { return "  ", nil },
+	} {
+		err := s.ValidateChannelKeys(ctx, decode)
+		if err == nil || err.Error() != "store: 渠道密钥校验失败" {
+			t.Fatalf("expected fixed safe validation error, got %v", err)
+		}
+	}
+	ciphertext, mask := rawChannelKey(t, s.DB(), channel.ID)
+	if ciphertext != input.KeyCiphertext || mask != input.KeyMask {
+		t.Fatal("key validation changed persisted values")
+	}
+	mustExec(t, s.DB(), `UPDATE channels SET key_ciphertext = 'corrupt-ciphertext-sentinel' WHERE id = ?`, channel.ID)
+	if err := s.ValidateChannelKeys(ctx, decrypt); err == nil || err.Error() != "store: 渠道密钥校验失败" {
+		t.Fatalf("corrupt ciphertext error = %v", err)
+	}
+}
+
 // TestChannelsTouchLastUsedMissing 覆盖对不存在渠道的运行态写入。
 func TestChannelsTouchLastUsedMissing(t *testing.T) {
 	ctx := context.Background()
@@ -493,7 +616,7 @@ func TestChannelsTouchLastUsedMissing(t *testing.T) {
 	if err := repo.TouchLastUsed(ctx, 404, time.Now()); !errors.Is(err, ErrChannelNotFound) {
 		t.Fatalf("TouchLastUsed 错误 = %v，期望 ErrChannelNotFound", err)
 	}
-	if err := repo.UpdateHealth(ctx, 404, ChannelHealth{Status: "unhealthy", At: time.Now()}); !errors.Is(err, ErrChannelNotFound) {
+	if err := repo.UpdateHealth(ctx, 404, ChannelHealth{Status: "unhealthy", At: time.Now(), ConnectionRevision: 1}); !errors.Is(err, ErrChannelNotFound) {
 		t.Fatalf("UpdateHealth 错误 = %v，期望 ErrChannelNotFound", err)
 	}
 	if _, err := repo.SetEnabled(ctx, 404, false); !errors.Is(err, ErrChannelNotFound) {

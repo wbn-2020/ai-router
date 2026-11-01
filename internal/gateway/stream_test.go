@@ -441,6 +441,7 @@ func TestStreamResponsesPostCommitFailureAfterUnterminatedEvent(t *testing.T) {
 		`data: {"type":"response.output_text.delta","sequence_number":1,"delta":"Hi"}`
 	first := newSSEFake(t,
 		responsesCreatedFrame("resp_truncated", "gpt-upstream-truncated", 0),
+		responsesTextDeltaFrame(1, "already committed"),
 		unterminated,
 	)
 	addResponsesChannel(t, stack, "truncated", first)
@@ -464,6 +465,9 @@ func TestStreamResponsesPostCommitFailureAfterUnterminatedEvent(t *testing.T) {
 	if !sawDelta || failedCount != 1 {
 		t.Fatalf("截断事件后终止帧错误：delta=%v failed=%d body=%q",
 			sawDelta, failedCount, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"delta":"Hi"`) || len(strictSSEData(rec.Body.String())) != 3 {
+		t.Fatalf("EOF残帧不应透传，完整已提交事件及failed必须可派发：%q", rec.Body.String())
 	}
 }
 
@@ -637,7 +641,7 @@ func TestStreamClientCancelCancelsUpstreamAndDoesNotRetry(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 
 	recorder := httptest.NewRecorder()
-	writer := newNotifyingWriter(recorder)
+	writer := newNotifyingWriter(&deadlineRecorder{ResponseRecorder: recorder})
 	done := make(chan struct{})
 	go func() {
 		stack.handler.ServeHTTP(writer, req)
@@ -710,6 +714,8 @@ func (w *notifyingWriter) Write(p []byte) (int, error) {
 	w.once.Do(func() { close(w.wrote) })
 	return n, err
 }
+
+func (w *notifyingWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func (w *notifyingWriter) Flush() {
 	if w.flusher != nil {
@@ -806,7 +812,7 @@ func TestClassifyStreamFrame(t *testing.T) {
 			name:      "Responses completed 成功终止",
 			protocol:  ProtocolOpenAIResponses,
 			event:     "response.completed",
-			data:      `{"type":"response.completed","response":{"status":"completed"}}`,
+			data:      `{"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","output":[]}}`,
 			semantic:  true,
 			completed: true,
 			terminal:  true,
@@ -922,5 +928,52 @@ func TestStreamRequestUsesStreamingUpstreamRequest(t *testing.T) {
 	}
 	if !payload.Stream {
 		t.Fatal("上游请求 stream 必须为 true")
+	}
+}
+
+// TestStreamRetriesNonSSE200AndFailsOver 覆盖 C7：上游忽略 stream=true 返回
+// 200 JSON 时，不能把它当空 SSE；应在提交前切换到下一个渠道。
+func TestStreamRetriesNonSSE200AndFailsOver(t *testing.T) {
+	stack := newProxyTestStack(t, proxyStackOptions{})
+	enableProxyStream(t, stack)
+
+	jsonFake := newProxyFakeUpstream(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"error":{"message":"stream not supported"}}`)
+	})
+	addResponsesChannel(t, stack, "json", jsonFake)
+
+	sseFake := newSSEFake(t,
+		responsesCreatedFrame("resp_1", "gpt-upstream-sse", 1),
+		responsesTextDeltaFrame(2, "hello"),
+		responsesCompletedFrame(3, "gpt-upstream-sse"),
+	)
+	addResponsesChannel(t, stack, "sse", sseFake)
+
+	rec := stack.do(t, PathResponses, streamResponsesBody())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HTTP 状态 = %d，期望 200；body=%s", rec.Code, rec.Body.String())
+	}
+	if got := jsonFake.hits.Load(); got != 1 {
+		t.Fatalf("JSON 上游调用 %d 次，期望 1", got)
+	}
+	if got := sseFake.hits.Load(); got != 1 {
+		t.Fatalf("SSE 上游调用 %d 次，期望 1", got)
+	}
+	if !strings.Contains(rec.Body.String(), "response.completed") {
+		t.Fatalf("最终响应不是 SSE 完成帧：%s", rec.Body.String())
+	}
+
+	detail := stack.latestDetail(t)
+	if detail.Request.AttemptCount != 2 {
+		t.Fatalf("attempt_count = %d，期望 2", detail.Request.AttemptCount)
+	}
+	if len(detail.Attempts) != 2 {
+		t.Fatalf("attempts = %d，期望 2", len(detail.Attempts))
+	}
+	if detail.Attempts[0].ErrorCode != errorCodeUpstreamError {
+		t.Fatalf("首个 attempt error_code = %q，期望 %q",
+			detail.Attempts[0].ErrorCode, errorCodeUpstreamError)
 	}
 }

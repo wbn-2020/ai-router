@@ -148,6 +148,9 @@ INSERT INTO request_attempts (
 //
 // 写入使用单条 INSERT（自动提交的短事务），不占用流式连接。同一 request_id
 // 只允许写入一次；重复写入会返回数据库唯一约束错误。
+//
+// 如果渠道在请求进行中被删除，channel_id 外键会让 INSERT 失败；此时保留
+// channel_name 快照并以 channel_id=NULL 重试，避免丢失整条请求日志。
 func (s *Store) WriteRequest(ctx context.Context, log RequestLog) error {
 	if err := s.ready(); err != nil {
 		return err
@@ -157,12 +160,24 @@ func (s *Store) WriteRequest(ctx context.Context, log RequestLog) error {
 		return err
 	}
 
+	err := s.insertRequestLog(ctx, log, log.ChannelID)
+	if err != nil && log.ChannelID != nil && isForeignKeyViolation(err) {
+		log.ChannelID = nil
+		err = s.insertRequestLog(ctx, log, nil)
+	}
+	if err != nil {
+		return fmt.Errorf("observability: 写入请求日志失败：%w", err)
+	}
+	return nil
+}
+
+func (s *Store) insertRequestLog(ctx context.Context, log RequestLog, channelID *int64) error {
 	_, err := s.db.ExecContext(ctx, insertRequestLogSQL,
 		log.RequestID,
 		log.Protocol,
 		log.Endpoint,
 		log.Model,
-		optionalInt64(log.ChannelID),
+		optionalInt64(channelID),
 		log.ChannelName,
 		log.Status,
 		optionalInt(log.HTTPStatus),
@@ -182,16 +197,14 @@ func (s *Store) WriteRequest(ctx context.Context, log RequestLog) error {
 		formatTime(log.StartedAt),
 		optionalTime(log.FinishedAt),
 	)
-	if err != nil {
-		return fmt.Errorf("observability: 写入请求日志失败：%w", err)
-	}
-	return nil
+	return err
 }
 
 // WriteAttempt 写入一次渠道尝试。
 //
 // attempt_index 从 1 开始；request_id 不设外键，允许在最终 request_log 之前
-// 先写 attempts（见 0001_init.sql 的注释）。
+// 先写 attempts（见 0001_init.sql 的注释）。渠道在请求进行中被删除时，
+// channel_id 外键会失败；此时保留 channel_name 快照并以 NULL 重试。
 func (s *Store) WriteAttempt(ctx context.Context, attempt RequestAttempt) error {
 	if err := s.ready(); err != nil {
 		return err
@@ -201,10 +214,22 @@ func (s *Store) WriteAttempt(ctx context.Context, attempt RequestAttempt) error 
 		return err
 	}
 
+	err := s.insertRequestAttempt(ctx, attempt, attempt.ChannelID)
+	if err != nil && attempt.ChannelID != nil && isForeignKeyViolation(err) {
+		attempt.ChannelID = nil
+		err = s.insertRequestAttempt(ctx, attempt, nil)
+	}
+	if err != nil {
+		return fmt.Errorf("observability: 写入渠道尝试失败：%w", err)
+	}
+	return nil
+}
+
+func (s *Store) insertRequestAttempt(ctx context.Context, attempt RequestAttempt, channelID *int64) error {
 	_, err := s.db.ExecContext(ctx, insertRequestAttemptSQL,
 		attempt.RequestID,
 		attempt.AttemptIndex,
-		optionalInt64(attempt.ChannelID),
+		optionalInt64(channelID),
 		attempt.ChannelName,
 		attempt.UpstreamModel,
 		attempt.Status,
@@ -216,10 +241,11 @@ func (s *Store) WriteAttempt(ctx context.Context, attempt RequestAttempt) error 
 		formatTime(attempt.StartedAt),
 		optionalTime(attempt.FinishedAt),
 	)
-	if err != nil {
-		return fmt.Errorf("observability: 写入渠道尝试失败：%w", err)
-	}
-	return nil
+	return err
+}
+
+func isForeignKeyViolation(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "FOREIGN KEY constraint failed")
 }
 
 // PruneResult 汇总一次保留期清理删除的行数。

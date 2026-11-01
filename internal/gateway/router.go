@@ -52,6 +52,10 @@ const (
 	ProtocolOpenAIResponses = store.ChannelProtocolOpenAIResponses
 	// ProtocolOpenAIChat 对应 Chat Completions 入站协议。
 	ProtocolOpenAIChat = store.ChannelProtocolOpenAIChat
+
+	// maxModelLength 限制客户端 model 字段长度，避免异常值放大 SQL 参数、
+	// 日志与错误 envelope。真实模型名远小于该值。
+	maxModelLength = 256
 )
 
 // RouteCatalog 是网关需要的模型映射读取能力。
@@ -83,6 +87,18 @@ func RequestInfoFromContext(ctx context.Context) (RequestInfo, bool) {
 	}
 	info, ok := ctx.Value(requestInfoContextKey{}).(RequestInfo)
 	return info, ok
+}
+
+type requestBodyContextKey struct{}
+
+// RequestBodyFromContext 返回路由阶段已经读取的请求体，避免代理层重复读取
+// 并复制大 body。只读，调用方不得修改返回的切片。
+func RequestBodyFromContext(ctx context.Context) ([]byte, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	body, ok := ctx.Value(requestBodyContextKey{}).([]byte)
+	return body, ok
 }
 
 // Options 是数据面 Handler 的构造参数。
@@ -186,7 +202,8 @@ func (h *Handler) serveData(
 		writeUnavailable(w)
 		return
 	}
-	candidates, err := h.routes.ListByModelAndProtocol(r.Context(), model, protocol)
+	ctx := context.WithValue(r.Context(), requestBodyContextKey{}, body)
+	candidates, err := h.routes.ListByModelAndProtocol(ctx, model, protocol)
 	if err != nil {
 		// 数据库/仓储错误只返回固定文案，绝不把 SQL 或上游信息写回客户端。
 		writeInternalError(w)
@@ -206,7 +223,7 @@ func (h *Handler) serveData(
 		Endpoint: endpoint,
 		Model:    model,
 	}
-	ctx := context.WithValue(r.Context(), requestInfoContextKey{}, info)
+	ctx = context.WithValue(ctx, requestInfoContextKey{}, info)
 	h.forwarder.ServeHTTP(w, r.WithContext(ctx))
 }
 
@@ -259,6 +276,10 @@ func decodeModel(w http.ResponseWriter, body []byte) (string, bool) {
 	model := strings.TrimSpace(payload.Model)
 	if model == "" {
 		writeMissingModel(w)
+		return "", false
+	}
+	if len(model) > maxModelLength {
+		writeModelTooLong(w)
 		return "", false
 	}
 	return model, true

@@ -23,7 +23,7 @@ func (responsesAdapter) path() string {
 }
 
 // probeBody 构造最小 Responses 请求：单条 ping 文本输入、很小的输出上限、
-// 非流式。探针只验证连通性与鉴权，不携带用户 prompt。
+// 非流式。探针验证该模型的生成响应，不携带用户 prompt。
 func (responsesAdapter) probeBody(upstreamModel string) ([]byte, error) {
 	payload := struct {
 		Model           string `json:"model"`

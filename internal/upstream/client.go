@@ -210,10 +210,11 @@ func adapterFor(protocol string) (adapter, error) {
 // 输出明文的格式化路径：String/GoString 永远脱敏 Key 并去掉 base URL 的
 // 查询串与 userinfo。
 type Target struct {
-	ChannelID   int64
-	ChannelName string
-	BaseURL     string
-	Protocol    string
+	ChannelID          int64
+	ConnectionRevision int64
+	ChannelName        string
+	BaseURL            string
+	Protocol           string
 	// APIKey 永远不参与 JSON 序列化；String/GoString 也会脱敏。
 	APIKey string `json:"-"`
 }

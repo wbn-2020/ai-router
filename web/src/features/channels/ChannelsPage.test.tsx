@@ -1,10 +1,15 @@
+import { useState } from 'react';
 import '@testing-library/jest-dom/vitest';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { setLoginRedirect } from '../../lib/api';
+import type { ModelRoute, ModelRouteInput, ModelRoutePatch } from '../mappings/api';
 import ChannelsPage from './ChannelsPage';
+import { ChannelModelPicker } from './ChannelModelPicker';
+import { ChannelTestResultView } from './ChannelTestResultView';
+import { formatChannelTimestamp } from './channelForm';
 import type { Channel, ChannelInput, ChannelPatch } from './types';
 
 const SECRET_PRIMARY = 'sk-live-PRIMARY-0123456789abcdef';
@@ -28,6 +33,7 @@ const PRIMARY: Channel = {
   base_url: 'https://codex.example.com/v1',
   protocol: 'openai_responses',
   key_mask: maskKey(SECRET_PRIMARY),
+  model_count: 2,
   priority: 10,
   max_concurrency: 4,
   enabled: true,
@@ -38,12 +44,63 @@ const PRIMARY: Channel = {
   updated_at: UPDATED_AT,
 };
 
+it('运行状态、启用和旧版本检查相互独立，缺失运行状态为未知', async () => {
+  const backend = createBackend([{
+    ...PRIMARY,
+    connection_revision: 3,
+    last_health_revision: 2,
+    last_health_model: 'historical-model',
+    last_health_protocol: 'openai_responses',
+    last_health_kind: 'generation',
+    last_health_duration_ms: 600,
+    runtime: { state: 'recovering', in_use: 1, limit: 4, model_cooldowns: 2, model_recovering: 1 },
+  }, BACKUP], {});
+  installFetch(backend.handler);
+  render(<ChannelsPage />);
+  await screen.findByText('codex-primary');
+  expect(screen.getByRole('columnheader', { name: '运行状态' })).toBeInTheDocument();
+  expect(screen.getByText('待恢复 / 恢复中')).toBeInTheDocument();
+  expect(screen.getByText('运行状态未知')).toBeInTheDocument();
+  expect(screen.getByText('已过期')).toBeInTheDocument();
+  expect(screen.getByText(/检查 v2 · 当前 v3/)).toBeInTheDocument();
+  expect(screen.getByText('historical-model')).toBeInTheDocument();
+  expect(screen.getByText('头 128 ms · 总 600 ms')).toBeInTheDocument();
+  expect(screen.getByRole('switch', { name: '渠道 codex-primary 启停' })).toBeChecked();
+});
+
+it('旧检查没有连接版本时不作为当前版本通过', async () => {
+  installFetch(createBackend([{ ...PRIMARY, connection_revision: 3, last_health_revision: 0 }], {}).handler);
+  render(<ChannelsPage />);
+  await screen.findByText('codex-primary');
+  expect(screen.getByText('已过期')).toBeInTheDocument();
+  expect(screen.getByText('本次通过')).toHaveClass('badge--muted');
+  expect(screen.getByText('检查 版本未知 · 当前 v3')).toBeInTheDocument();
+  expect(screen.getByText('运行状态未知')).toBeInTheDocument();
+});
+
+it('单次生成预算截断保持不确定，不给出成功或失败样式', () => {
+  render(<ChannelTestResultView label="预算检查" result={{
+    status: 'inconclusive', http_status: 200, latency_ms: 12, duration_ms: 90,
+    error_code: 'output_limit', error: '输出预算耗尽', protocol: 'openai_chat',
+    connection_revision: 7, kind: 'generation', channel_id: 1, channel_name: 'test',
+    upstream_model: 'm', tested_at: CREATED_AT, request_link: '/admin/requests',
+  }} />);
+  const result = screen.getByRole('region', { name: '预算检查' });
+  expect(within(result).getByText('不确定')).toBeInTheDocument();
+  expect(within(result).queryByText('失败')).not.toBeInTheDocument();
+  expect(within(result).queryByText('通过')).not.toBeInTheDocument();
+  expect(result).not.toHaveClass('model-check--healthy', 'model-check--unhealthy');
+  expect(within(result).getByText(/不代表通过或失败/)).toBeInTheDocument();
+  expect(within(result).getByText('v7')).toBeInTheDocument();
+});
+
 const BACKUP: Channel = {
   id: 2,
   name: 'chat-backup',
   base_url: 'https://chat.example.com/v1?api-version=2026-01-01',
   protocol: 'openai_chat',
   key_mask: maskKey(SECRET_BACKUP),
+  model_count: 1,
   priority: 20,
   max_concurrency: 2,
   enabled: false,
@@ -83,7 +140,7 @@ function requestURL(input: RequestInfo | URL): string {
   return input.url;
 }
 
-function installFetch(handler: (url: string, init: RequestInit) => Response) {
+function installFetch(handler: (url: string, init: RequestInit) => Response | Promise<Response>) {
   const fetchMock = vi.fn<typeof fetch>(async (input, init) => handler(requestURL(input), init ?? {}));
   vi.stubGlobal('fetch', fetchMock);
   return fetchMock;
@@ -101,20 +158,46 @@ function hasRequest(fetchMock: FetchMock, url: string, method: string): boolean 
   return callsFor(fetchMock, url, method).length > 0;
 }
 
-/**
- * createBackend 模拟 T07/T08/T22 后端：
- * - 列表只返回 key_mask，完整 Key 只经 /key 端点返回；
- * - 创建/更新保存密文对应的测试明文，用于断言 mask 更新；
- * - 删除返回 204；调试端点可由用例替换为成功/失败响应。
- */
-function createBackend(initialChannels: Channel[], initialSecrets: Record<number, string>) {
+function deferred<Value>() {
+  let resolve!: (value: Value) => void;
+  const promise = new Promise<Value>((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
+
+function modelRoute(patch: Partial<ModelRoute> = {}): ModelRoute {
+  return {
+    id: 11,
+    client_model: 'codex-alias',
+    channel_id: 1,
+    upstream_model: 'gpt-5.1-codex',
+    priority: 7,
+    enabled: true,
+    created_at: CREATED_AT,
+    updated_at: UPDATED_AT,
+    ...patch,
+  };
+}
+
+async function openMore(user: ReturnType<typeof userEvent.setup>, name: string) {
+  const summary = screen.getByLabelText(`渠道 ${name} 的更多操作`);
+  const details = summary.closest('details');
+  if (!details?.open) {
+    await user.click(summary);
+  }
+}
+
+/** fake 后端只在内存中保留 Key；所有端点由 fetch stub 截获。 */
+function createBackend(initialChannels: Channel[], initialSecrets: Record<number, string>, initialRoutes: ModelRoute[] = []) {
   const channels = initialChannels.map((channel) => ({ ...channel }));
   const secrets = new Map<number, string>();
   for (const [rawID, key] of Object.entries(initialSecrets)) {
     secrets.set(Number(rawID), key);
   }
   let nextID = 100;
-  let debugHandler: ((channel: Channel) => Response) | null = null;
+  let nextRouteID = 1000;
+  const routes = initialRoutes.map((route) => ({ ...route }));
+  let debugHandler: ((channel: Channel, body: { model?: string }) => Response) | null = null;
+  let discoveryModels = ['gpt-5', 'o3'];
 
   const find = (id: number): Channel | undefined => channels.find((channel) => channel.id === id);
 
@@ -128,6 +211,53 @@ function createBackend(initialChannels: Channel[], initialSecrets: Record<number
       return jsonResponse({ channels });
     }
 
+    if (url === '/admin/api/model-routes' && method === 'GET') {
+      return jsonResponse({ model_routes: routes });
+    }
+    if (url === '/admin/api/model-routes' && method === 'POST') {
+      const body = JSON.parse(String(init.body)) as ModelRouteInput;
+      if (routes.some((route) => route.channel_id === body.channel_id && route.client_model === body.client_model)) {
+        return jsonResponse({ error: 'model_route_conflict', message: '模型已存在' }, 409);
+      }
+      const created = modelRoute({ ...body, id: nextRouteID++ });
+      routes.push(created);
+      const channel = find(body.channel_id);
+      if (channel !== undefined) {
+        channel.model_count += 1;
+      }
+      return jsonResponse(created, 201);
+    }
+    const routeMatch = /^\/admin\/api\/model-routes\/(\d+)$/.exec(url);
+    if (routeMatch !== null) {
+      const index = routes.findIndex((route) => route.id === Number(routeMatch[1]));
+      const route = routes[index];
+      if (route === undefined) {
+        return jsonResponse({ error: 'model_route_not_found', message: '模型不存在' }, 404);
+      }
+      if (method === 'PATCH') {
+        const patch = JSON.parse(String(init.body)) as ModelRoutePatch;
+        const updated = { ...route, ...patch, updated_at: UPDATED_AT };
+        routes[index] = updated;
+        return jsonResponse(updated);
+      }
+      if (method === 'DELETE') {
+        routes.splice(index, 1);
+        const channel = find(route.channel_id);
+        if (channel !== undefined) {
+          channel.model_count -= 1;
+        }
+        return emptyResponse(204);
+      }
+    }
+
+    if (url === '/admin/api/channels/preview-models' && method === 'POST') {
+      return jsonResponse({ models: discoveryModels });
+    }
+
+    if (/^\/admin\/api\/channels\/\d+\/models\/sync$/.test(url) && method === 'POST') {
+      return jsonResponse({ models: discoveryModels });
+    }
+
     if (url === '/admin/api/channels' && method === 'POST') {
       const body = JSON.parse(String(init.body)) as ChannelInput;
       if (channels.some((channel) => channel.name === body.name)) {
@@ -139,6 +269,7 @@ function createBackend(initialChannels: Channel[], initialSecrets: Record<number
         base_url: body.base_url,
         protocol: body.protocol,
         key_mask: maskKey(body.key),
+        model_count: body.models?.length ?? 0,
         priority: body.priority,
         max_concurrency: body.max_concurrency,
         enabled: body.enabled,
@@ -148,6 +279,9 @@ function createBackend(initialChannels: Channel[], initialSecrets: Record<number
       nextID += 1;
       secrets.set(created.id, body.key);
       channels.push(created);
+      for (const model of body.models ?? []) {
+        routes.push(modelRoute({ id: nextRouteID++, client_model: model, upstream_model: model, channel_id: created.id, priority: 0 }));
+      }
       return jsonResponse(created, 201);
     }
 
@@ -176,7 +310,7 @@ function createBackend(initialChannels: Channel[], initialSecrets: Record<number
           400,
         );
       }
-      return debugHandler(channel);
+      return debugHandler(channel, JSON.parse(String(init.body)) as { model?: string });
     }
 
     const match = /^\/admin\/api\/channels\/(\d+)$/.exec(url);
@@ -219,11 +353,306 @@ function createBackend(initialChannels: Channel[], initialSecrets: Record<number
   return {
     handler,
     channels,
-    setDebugHandler(next: ((channel: Channel) => Response) | null) {
+    routes,
+    setDebugHandler(next: ((channel: Channel, body: { model?: string }) => Response) | null) {
       debugHandler = next;
+    },
+    setDiscoveryModels(next: string[]) {
+      discoveryModels = next;
     },
   };
 }
+
+describe('模型选择器：搜索与连接代次', () => {
+  it('全选和清空只作用于搜索结果，保留手填和隐藏选中', async () => {
+    const fetchModels = vi.fn(async () => ['gpt-5', 'o3', 'gpt-5']);
+    function Picker() {
+      const [models, setModels] = useState(['manual-model', 'o3']);
+      return <ChannelModelPicker value={models} onChange={setModels} fetchModels={fetchModels} />;
+    }
+    const user = userEvent.setup();
+    render(<Picker />);
+    await user.click(screen.getByRole('button', { name: '从上游获取' }));
+    await screen.findByText('已从上游获取 2 个模型。');
+    await user.type(screen.getByRole('searchbox', { name: '搜索模型' }), 'gpt');
+    await user.click(screen.getByRole('button', { name: '全选结果' }));
+    expect(screen.getByText('已选 3')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '移除模型 manual-model' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '移除模型 o3' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '取消结果' }));
+    expect(screen.getByText('已选 2')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '移除模型 gpt-5' })).not.toBeInTheDocument();
+    await user.clear(screen.getByRole('searchbox', { name: '搜索模型' }));
+    expect(screen.getByRole('checkbox', { name: '选择模型 o3' })).toBeChecked();
+  });
+
+  it('连接代次变化清候选但保留选中，旧异步结果不覆盖新结果', async () => {
+    const oldRequest = deferred<string[]>();
+    const onChange = vi.fn();
+    const props = { value: ['manual-model'], onChange };
+    const { rerender } = render(<ChannelModelPicker {...props} generation={0} fetchModels={() => oldRequest.promise} />);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: '从上游获取' }));
+    rerender(<ChannelModelPicker {...props} generation={1} fetchModels={async () => ['new-model']} />);
+    await user.click(screen.getByRole('button', { name: '从上游获取' }));
+    await screen.findByRole('checkbox', { name: '选择模型 new-model' });
+    await act(async () => oldRequest.resolve(['stale-model']));
+    expect(screen.queryByRole('checkbox', { name: '选择模型 stale-model' })).not.toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: '选择模型 new-model' })).toBeInTheDocument();
+    rerender(<ChannelModelPicker {...props} generation={2} fetchModels={async () => []} />);
+    expect(screen.queryByRole('checkbox', { name: '选择模型 new-model' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '移除模型 manual-model' })).toBeInTheDocument();
+    expect(onChange).not.toHaveBeenCalled();
+  });
+});
+
+describe('渠道编辑：连接、模型与单次检查', () => {
+  it('新建同页显示预设连接模型，自动名称保留人工修改，三项连接输入都会失效候选', async () => {
+    const backend = createBackend([], {});
+    backend.setDiscoveryModels(['gpt-5', 'o3']);
+    const fetchMock = installFetch(backend.handler);
+    const user = userEvent.setup();
+    render(<ChannelsPage />);
+    await screen.findByText('尚未配置渠道');
+    await user.click(screen.getByRole('button', { name: '新建渠道' }));
+    const dialog = await screen.findByRole('dialog', { name: '新建渠道' });
+    expect(within(dialog).getByLabelText('供应商预设').tagName).toBe('SELECT');
+    expect(within(dialog).queryByLabelText('新建渠道步骤')).not.toBeInTheDocument();
+    expect(within(dialog).getByLabelText('Base URL')).toHaveValue('https://api.openai.com/v1');
+    expect(within(dialog).getByLabelText('渠道名称')).toHaveValue('api.openai.com-responses');
+    expect(within(dialog).getByRole('button', { name: '从上游获取模型' })).toBeDisabled();
+    await user.type(within(dialog).getByLabelText('上游 Key'), 'sk-fake-candidates');
+    await user.click(within(dialog).getByRole('button', { name: '从上游获取模型' }));
+    await within(dialog).findByRole('checkbox', { name: '选择模型 gpt-5' });
+    await user.click(within(dialog).getByRole('checkbox', { name: '选择模型 gpt-5' }));
+    fireEvent.change(within(dialog).getByLabelText('Base URL'), { target: { value: 'https://relay.example.com/v1' } });
+    expect(within(dialog).queryByRole('checkbox', { name: '选择模型 gpt-5' })).not.toBeInTheDocument();
+    expect(within(dialog).getByRole('button', { name: '移除模型 gpt-5' })).toBeInTheDocument();
+    expect(within(dialog).getByLabelText('渠道名称')).toHaveValue('relay.example.com-responses');
+    await user.click(within(dialog).getByRole('button', { name: '从上游获取模型' }));
+    await within(dialog).findByRole('checkbox', { name: '选择模型 o3' });
+    fireEvent.change(within(dialog).getByLabelText('上游 Key'), { target: { value: 'sk-fake-rotated' } });
+    expect(within(dialog).queryByRole('checkbox', { name: '选择模型 o3' })).not.toBeInTheDocument();
+    await user.click(within(dialog).getByRole('button', { name: '从上游获取模型' }));
+    await within(dialog).findByRole('checkbox', { name: '选择模型 o3' });
+    await user.click(within(dialog).getByText('高级设置'));
+    await user.selectOptions(within(dialog).getByLabelText('协议'), 'openai_chat');
+    expect(within(dialog).queryByRole('checkbox', { name: '选择模型 o3' })).not.toBeInTheDocument();
+    expect(within(dialog).getByLabelText('渠道名称')).toHaveValue('relay.example.com-chat');
+    await user.clear(within(dialog).getByLabelText('渠道名称'));
+    await user.type(within(dialog).getByLabelText('渠道名称'), 'my-relay');
+    await user.selectOptions(within(dialog).getByLabelText('供应商预设'), 'openai-responses');
+    expect(within(dialog).getByLabelText('渠道名称')).toHaveValue('my-relay');
+    expect(within(dialog).getByRole('button', { name: '移除模型 gpt-5' })).toBeInTheDocument();
+    await user.click(within(dialog).getByRole('button', { name: '创建渠道' }));
+    await screen.findByText('渠道「my-relay」已创建，并添加 1 个模型。');
+    const posts = callsFor(fetchMock, '/admin/api/channels', 'POST');
+    expect(posts).toHaveLength(1);
+    expect(JSON.parse(String(posts[0]?.[1]?.body))).toMatchObject({ name: 'my-relay', models: ['gpt-5'] });
+    expect(callsFor(fetchMock, '/admin/api/model-routes', 'POST')).toHaveLength(0);
+  });
+
+  it('模型表单在连接 form 外，立即 CRUD 保留 route id、alias、priority 和 enabled', async () => {
+    const route = modelRoute();
+    const backend = createBackend([PRIMARY], { 1: SECRET_PRIMARY }, [route]);
+    const fetchMock = installFetch(backend.handler);
+    const user = userEvent.setup();
+    render(<ChannelsPage />);
+    await screen.findByText(PRIMARY.name);
+    await user.click(screen.getByRole('button', { name: '编辑渠道 codex-primary' }));
+    const dialog = await screen.findByRole('dialog');
+    const manual = within(dialog).getByRole('form', { name: '手动添加模型映射' });
+    const saveButton = within(dialog).getByRole('button', { name: '保存连接配置' }) as HTMLButtonElement;
+    const connectionForm = saveButton.form;
+    expect(connectionForm).toHaveAttribute('id', 'channel-connection-form');
+    expect(saveButton.closest('form')).toBeNull();
+    expect(connectionForm?.contains(manual)).toBe(false);
+    await within(dialog).findByRole('button', { name: '编辑模型 codex-alias' });
+    await user.click(within(dialog).getByRole('switch', { name: '启用模型 codex-alias' }));
+    await waitFor(() => expect(within(dialog).getByRole('switch', { name: '启用模型 codex-alias' })).toHaveAttribute('aria-checked', 'false'));
+    expect(backend.routes[0]).toMatchObject({ id: route.id, client_model: route.client_model, upstream_model: route.upstream_model, priority: 7, enabled: false });
+    await user.click(within(dialog).getByRole('button', { name: '编辑模型 codex-alias' }));
+    const edit = within(dialog).getByRole('form', { name: '编辑模型映射' });
+    expect(connectionForm?.contains(edit)).toBe(false);
+    await user.clear(within(edit).getByLabelText('客户端模型'));
+    await user.type(within(edit).getByLabelText('客户端模型'), 'renamed-alias');
+    await user.clear(within(edit).getByLabelText('上游模型'));
+    await user.type(within(edit).getByLabelText('上游模型'), 'upstream-v2');
+    await user.clear(within(edit).getByLabelText('优先级'));
+    await user.type(within(edit).getByLabelText('优先级'), '9');
+    await user.click(within(edit).getByRole('button', { name: '保存模型映射' }));
+    await within(dialog).findByText('模型映射已更新。');
+    expect(backend.routes[0]).toMatchObject({ id: route.id, client_model: 'renamed-alias', upstream_model: 'upstream-v2', priority: 9, enabled: false });
+    const patches = callsFor(fetchMock, '/admin/api/model-routes/11', 'PATCH');
+    expect(patches).toHaveLength(2);
+    expect(JSON.parse(String(patches[0]?.[1]?.body))).toEqual({ enabled: false });
+    expect(JSON.parse(String(patches[1]?.[1]?.body))).toEqual({ client_model: 'renamed-alias', upstream_model: 'upstream-v2', priority: 9 });
+    await user.type(within(manual).getByLabelText('客户端模型'), 'manual-alias');
+    await user.type(within(manual).getByLabelText('上游模型（留空同名）'), 'manual-upstream');
+    await user.click(within(manual).getByRole('button', { name: '手动添加' }));
+    await within(dialog).findByText('已添加模型「manual-alias」。');
+    await user.click(within(dialog).getByRole('button', { name: '删除模型 renamed-alias' }));
+    expect(callsFor(fetchMock, '/admin/api/model-routes/11', 'DELETE')).toHaveLength(0);
+    await user.click(within(dialog).getByRole('button', { name: '确认删除模型 renamed-alias' }));
+    await within(dialog).findByText('已删除模型「renamed-alias」。');
+    expect(callsFor(fetchMock, '/admin/api/channels/1', 'PATCH')).toHaveLength(0);
+    await user.keyboard('{Escape}');
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(await screen.findByRole('button', { name: '管理渠道 codex-primary 的模型' })).toHaveTextContent('2 个模型');
+  });
+
+  it('dirty 禁用保存候选和模型测试，连接保存后 snapshot/key 更新并可继续测试固定 alias', async () => {
+    const route = modelRoute();
+    const disabledRoute = modelRoute({ id: 12, client_model: 'disabled-alias', enabled: false });
+    const backend = createBackend([PRIMARY, BACKUP], { 1: SECRET_PRIMARY, 2: SECRET_BACKUP }, [route, disabledRoute]);
+    backend.setDebugHandler((channel, body) => jsonResponse({
+      status: 'unhealthy', http_status: 200, latency_ms: 31, error: '上游响应缺少有效输出',
+      channel_id: channel.id, channel_name: channel.name, model: body.model,
+      upstream_model: route.upstream_model, tested_at: '2026-10-30T10:00:00Z',
+      request_link: '/admin/requests?channel_id=1&model=codex-alias',
+    }));
+    const fetchMock = installFetch(backend.handler);
+    const user = userEvent.setup();
+    render(<ChannelsPage />);
+    await screen.findByText(PRIMARY.name);
+    await user.click(screen.getByRole('button', { name: '编辑渠道 codex-primary' }));
+    const dialog = await screen.findByRole('dialog');
+    const test = await within(dialog).findByRole('button', { name: '测试模型 codex-alias' });
+    expect(test).toBeEnabled();
+    expect(within(dialog).getByRole('button', { name: '测试模型 disabled-alias' })).toBeDisabled();
+    expect(within(dialog).getAllByText('未检查')).toHaveLength(2);
+    await user.click(within(dialog).getByRole('button', { name: '从上游同步' }));
+    await user.click(within(dialog).getByRole('button', { name: '获取上游模型' }));
+    await within(dialog).findByRole('checkbox', { name: '选择模型 gpt-5' });
+    await user.click(within(dialog).getByRole('checkbox', { name: '选择模型 gpt-5' }));
+    fireEvent.change(within(dialog).getByLabelText('Base URL'), { target: { value: 'https://saved-relay.example.com/v1' } });
+    expect(within(dialog).queryByRole('checkbox', { name: '选择模型 gpt-5' })).not.toBeInTheDocument();
+    expect(within(dialog).getByRole('button', { name: '移除模型 gpt-5' })).toBeInTheDocument();
+    expect(within(dialog).getByText('连接配置尚未保存，请先保存连接配置后再获取或测试模型。')).toBeInTheDocument();
+    expect(within(dialog).getByRole('button', { name: '获取上游模型' })).toBeDisabled();
+    expect(within(dialog).getByRole('button', { name: '添加选中模型' })).toBeDisabled();
+    expect(test).toBeDisabled();
+    await user.click(test);
+    expect(callsFor(fetchMock, '/admin/api/debug/channels/1/test', 'POST')).toHaveLength(0);
+    await user.click(within(dialog).getByRole('button', { name: '保存连接配置' }));
+    await within(dialog).findByText('连接配置已保存，现在可获取或测试模型。');
+    expect(dialog).toBeInTheDocument();
+    expect(within(dialog).getByLabelText(/上游 Key/)).toHaveValue('');
+    expect(test).toBeEnabled();
+    expect(within(dialog).getByRole('button', { name: '获取上游模型' })).toBeEnabled();
+    expect(within(dialog).getByRole('button', { name: '添加选中模型' })).toBeEnabled();
+    const patch = callsFor(fetchMock, '/admin/api/channels/1', 'PATCH')[0];
+    expect(JSON.parse(String(patch?.[1]?.body))).not.toHaveProperty('key');
+    await user.click(test);
+    const result = await within(dialog).findByRole('region', { name: '模型 codex-alias 的测试结果' });
+    expect(within(result).getByText('失败')).toBeInTheDocument();
+    expect(within(result).getByText('200')).toBeInTheDocument();
+    expect(within(result).getByText(route.client_model)).toBeInTheDocument();
+    expect(within(result).getByText(route.upstream_model)).toBeInTheDocument();
+    expect(within(result).getByText(formatChannelTimestamp('2026-10-30T10:00:00Z'))).toBeInTheDocument();
+    expect(within(result).getByRole('link')).toHaveAttribute('href', '/admin/requests?channel_id=1&model=codex-alias');
+    expect(within(dialog).getByText('本次失败')).toBeInTheDocument();
+    expect(within(dialog).getByText('未检查')).toBeInTheDocument();
+    const testCalls = callsFor(fetchMock, '/admin/api/debug/channels/1/test', 'POST');
+    expect(testCalls).toHaveLength(1);
+    expect(JSON.parse(String(testCalls[0]?.[1]?.body))).toEqual({ model: route.client_model });
+    expect(callsFor(fetchMock, '/admin/api/debug/channels/2/test', 'POST')).toHaveLength(0);
+    expect(callsFor(fetchMock, '/admin/api/channels/1/key', 'GET')).toHaveLength(0);
+    backend.setDebugHandler((channel, body) => jsonResponse({
+      status: 'inconclusive', http_status: 200, latency_ms: 12, duration_ms: 52,
+      error_code: 'output_limit', protocol: channel.protocol, connection_revision: 2, kind: 'generation',
+      channel_id: channel.id, channel_name: channel.name, model: body.model,
+      upstream_model: route.upstream_model, tested_at: CREATED_AT, request_link: '/admin/requests',
+    }));
+    await user.click(test);
+    expect(await within(dialog).findByText('本次不确定')).toBeInTheDocument();
+    expect(within(dialog).queryByText('本次失败')).not.toBeInTheDocument();
+    expect(within(dialog).getByText('未检查')).toBeInTheDocument();
+    await user.type(within(dialog).getByLabelText(/上游 Key/), SECRET_ROTATED);
+    expect(within(dialog).queryByRole('region', { name: '模型 codex-alias 的测试结果' })).not.toBeInTheDocument();
+    expect(test).toBeDisabled();
+    await user.click(within(dialog).getByRole('button', { name: '保存连接配置' }));
+    await within(dialog).findByText(maskKey(SECRET_ROTATED));
+    expect(within(dialog).getByLabelText(/上游 Key/)).toHaveValue('');
+    expect(test).toBeEnabled();
+  });
+
+  it('pending 创建、连接 PATCH 和模型 CRUD 统一关闭/Escape/重复提交保护并恢复焦点', async () => {
+    const createdRequest = deferred<Response>();
+    const updatedRequest = deferred<Response>();
+    const routeRequest = deferred<Response>();
+    const backend = createBackend([PRIMARY], { 1: SECRET_PRIMARY });
+    let pendingCreate = true;
+    let pendingPatch = true;
+    let pendingRoute = true;
+    const fetchMock = installFetch((url, init) => {
+      if (url === '/admin/api/channels' && init.method === 'POST' && pendingCreate) {
+        return createdRequest.promise;
+      }
+      if (url === '/admin/api/channels/1' && init.method === 'PATCH' && pendingPatch) {
+        return updatedRequest.promise;
+      }
+      if (url === '/admin/api/model-routes' && init.method === 'POST' && pendingRoute) {
+        return routeRequest.promise;
+      }
+      return backend.handler(url, init);
+    });
+    const user = userEvent.setup();
+    render(<ChannelsPage />);
+    await screen.findByText(PRIMARY.name);
+    const createButton = screen.getByRole('button', { name: '新建渠道' });
+    await user.click(createButton);
+    let dialog = await screen.findByRole('dialog', { name: '新建渠道' });
+    await user.type(within(dialog).getByLabelText('上游 Key'), 'sk-fake-pending');
+    const submit = within(dialog).getByRole('button', { name: '创建渠道' });
+    await user.click(submit);
+    expect(within(dialog).getByRole('button', { name: '关闭渠道表单' })).toBeDisabled();
+    await user.keyboard('{Escape}');
+    fireEvent.mouseDown(dialog.parentElement!);
+    fireEvent.submit((submit as HTMLButtonElement).form!);
+    expect(dialog).toBeInTheDocument();
+    expect(callsFor(fetchMock, '/admin/api/channels', 'POST')).toHaveLength(1);
+    pendingCreate = false;
+    const createCall = callsFor(fetchMock, '/admin/api/channels', 'POST')[0]!;
+    await act(async () => createdRequest.resolve(backend.handler('/admin/api/channels', createCall[1]!)));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(createButton).toHaveFocus();
+
+    const editButton = screen.getByRole('button', { name: '编辑渠道 codex-primary' });
+    await user.click(editButton);
+    dialog = await screen.findByRole('dialog');
+    fireEvent.change(within(dialog).getByLabelText('Base URL'), { target: { value: 'https://new.example.com/v1' } });
+    const save = within(dialog).getByRole('button', { name: '保存连接配置' });
+    await user.click(save);
+    await user.keyboard('{Escape}');
+    fireEvent.mouseDown(dialog.parentElement!);
+    fireEvent.submit((save as HTMLButtonElement).form!);
+    expect(dialog).toBeInTheDocument();
+    expect(within(dialog).getByRole('button', { name: '完成' })).toBeDisabled();
+    expect(callsFor(fetchMock, '/admin/api/channels/1', 'PATCH')).toHaveLength(1);
+    pendingPatch = false;
+    const patchCall = callsFor(fetchMock, '/admin/api/channels/1', 'PATCH')[0]!;
+    await act(async () => updatedRequest.resolve(backend.handler('/admin/api/channels/1', patchCall[1]!)));
+    await within(dialog).findByText('连接配置已保存，现在可获取或测试模型。');
+
+    const manual = within(dialog).getByRole('form', { name: '手动添加模型映射' });
+    await user.type(within(manual).getByLabelText('客户端模型'), 'pending-model');
+    await user.click(within(manual).getByRole('button', { name: '手动添加' }));
+    expect(within(dialog).getByRole('button', { name: '关闭渠道表单' })).toBeDisabled();
+    await user.keyboard('{Escape}');
+    fireEvent.submit(manual);
+    expect(dialog).toBeInTheDocument();
+    expect(callsFor(fetchMock, '/admin/api/model-routes', 'POST')).toHaveLength(1);
+    pendingRoute = false;
+    const routeCall = callsFor(fetchMock, '/admin/api/model-routes', 'POST')[0]!;
+    await act(async () => routeRequest.resolve(backend.handler('/admin/api/model-routes', routeCall[1]!)));
+    await within(dialog).findByText('已添加模型「pending-model」。');
+    await user.keyboard('{Escape}');
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(editButton).toHaveFocus();
+    expect(callsFor(fetchMock, '/admin/api/channels', 'GET')).toHaveLength(2);
+  });
+});
 
 let redirectSpy = vi.fn();
 
@@ -250,10 +679,16 @@ describe('渠道页：脱敏 Key、揭示与复制', () => {
 
     render(<ChannelsPage />);
 
-    expect(await screen.findByText(PRIMARY.key_mask)).toBeInTheDocument();
+    expect(await screen.findByText(PRIMARY.name)).toBeInTheDocument();
+    await openMore(user, PRIMARY.name);
+    await openMore(user, BACKUP.name);
+    expect(screen.getByText(PRIMARY.key_mask)).toBeInTheDocument();
     expect(screen.getByText(BACKUP.key_mask)).toBeInTheDocument();
-    expect(screen.getByText('正常 · 128 ms')).toBeInTheDocument();
-    expect(screen.getByText('异常')).toBeInTheDocument();
+    expect(screen.getByText('本次通过')).toBeInTheDocument();
+    expect(screen.getByText('本次失败')).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: '最近检查' })).toBeInTheDocument();
+    expect(screen.getByText(formatChannelTimestamp(PRIMARY.last_health_at))).toBeVisible();
+    expect(screen.getByText('检查时间未知')).toBeVisible();
 
     // 初始状态不请求揭示端点，DOM 中也没有完整 Key。
     expect(callsFor(fetchMock, '/admin/api/channels/1/key', 'GET')).toHaveLength(0);
@@ -295,7 +730,8 @@ describe('渠道页：脱敏 Key、揭示与复制', () => {
     const user = userEvent.setup();
 
     render(<ChannelsPage />);
-    await screen.findByText(PRIMARY.key_mask);
+    await screen.findByText(PRIMARY.name);
+    await openMore(user, PRIMARY.name);
     await user.click(
       screen.getByRole('button', { name: '显示渠道 codex-primary 的完整 Key' }),
     );
@@ -319,10 +755,12 @@ describe('渠道页：创建与编辑', () => {
 
     expect(await screen.findByText('尚未配置渠道')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '添加第一个渠道' }));
+    await user.selectOptions(await screen.findByLabelText('供应商预设'), 'custom-responses');
 
     await user.type(screen.getByLabelText('渠道名称'), 'bad-channel');
     await user.type(screen.getByLabelText('Base URL'), 'not-a-url');
     await user.type(screen.getByLabelText('上游 Key'), 'sk-test-123456');
+    await user.click(screen.getByText('高级设置'));
     await user.clear(screen.getByLabelText('并发上限'));
     await user.type(screen.getByLabelText('并发上限'), '0');
     await user.click(screen.getByRole('button', { name: '创建渠道' }));
@@ -345,6 +783,7 @@ describe('渠道页：创建与编辑', () => {
     await user.click(screen.getByRole('button', { name: '创建渠道' }));
 
     expect(await screen.findByText('渠道「bad-channel」已创建。')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '新建渠道' })).toHaveFocus();
 
     const postCalls = callsFor(fetchMock, '/admin/api/channels', 'POST');
     expect(postCalls).toHaveLength(1);
@@ -353,6 +792,7 @@ describe('渠道页：创建与编辑', () => {
       base_url: 'https://upstream.example.com/v1',
       protocol: 'openai_responses',
       key: 'sk-test-123456',
+      models: [],
       priority: 0,
       max_concurrency: 3,
       enabled: true,
@@ -376,15 +816,16 @@ describe('渠道页：创建与编辑', () => {
     expect(within(dialog).getByLabelText('渠道名称')).toHaveValue('codex-primary');
     expect(within(dialog).getByLabelText('Base URL')).toHaveValue(PRIMARY.base_url);
     expect(within(dialog).getByLabelText(/上游 Key/)).toHaveValue('');
+    await user.click(within(dialog).getByText('高级设置'));
 
     await user.clear(within(dialog).getByLabelText('优先级'));
     await user.type(within(dialog).getByLabelText('优先级'), '3');
-    await user.click(within(dialog).getByRole('button', { name: '保存修改' }));
+    await user.click(within(dialog).getByRole('button', { name: '保存连接配置' }));
 
     expect(await screen.findByText('渠道「codex-primary」已更新。')).toBeInTheDocument();
-    await waitFor(() => {
-      expect(callsFor(fetchMock, '/admin/api/channels', 'GET').length).toBeGreaterThan(1);
-    });
+    expect(await within(dialog).findByText('连接配置已保存，现在可获取或测试模型。')).toBeInTheDocument();
+    expect(callsFor(fetchMock, '/admin/api/channels', 'GET')).toHaveLength(1);
+    expect(dialog).toBeInTheDocument();
 
     const firstPatch = callsFor(fetchMock, '/admin/api/channels/1', 'PATCH')[0];
     expect(firstPatch).toBeDefined();
@@ -392,13 +833,11 @@ describe('渠道页：创建与编辑', () => {
     expect(firstBody).not.toHaveProperty('key');
     expect(firstBody.priority).toBe(3);
 
-    // 再次编辑并填写新 Key：PATCH 带 key，返回的 mask 刷新到列表。
-    await user.click(screen.getByRole('button', { name: '编辑渠道 codex-primary' }));
-    dialog = await screen.findByRole('dialog', { name: '编辑渠道：codex-primary' });
+    // 保存后继续在同一抽屉轮换 Key。
     await user.type(within(dialog).getByLabelText(/上游 Key/), SECRET_ROTATED);
-    await user.click(within(dialog).getByRole('button', { name: '保存修改' }));
+    await user.click(within(dialog).getByRole('button', { name: '保存连接配置' }));
 
-    expect(await screen.findByText(maskKey(SECRET_ROTATED))).toBeInTheDocument();
+    expect(await within(dialog).findByText(maskKey(SECRET_ROTATED))).toBeInTheDocument();
 
     const patchCalls = callsFor(fetchMock, '/admin/api/channels/1', 'PATCH');
     expect(patchCalls).toHaveLength(2);
@@ -436,6 +875,7 @@ describe('渠道页：启停、删除与测试', () => {
       screen.getByRole('switch', { name: '渠道 codex-primary 启停' }),
     ).toHaveAttribute('aria-checked', 'true');
 
+    await openMore(user, PRIMARY.name);
     await user.click(screen.getByRole('button', { name: '删除渠道 codex-primary' }));
     // 第一次点击只进入确认态，不发 DELETE。
     expect(hasRequest(fetchMock, '/admin/api/channels/1', 'DELETE')).toBe(false);
@@ -471,14 +911,17 @@ describe('渠道页：启停、删除与测试', () => {
 
     render(<ChannelsPage />);
     await screen.findByText(PRIMARY.key_mask);
-    expect(screen.getByText('正常 · 128 ms')).toBeInTheDocument();
+    expect(screen.getByText('本次通过')).toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: '测试渠道 codex-primary' }));
 
     expect(
       await screen.findByText('测试失败：上游返回 HTTP 429 Too Many Requests'),
     ).toBeInTheDocument();
-    expect(screen.getByText('失败')).toBeInTheDocument();
+    const testResult = screen.getByRole('region', { name: '渠道 codex-primary 的测试结果' });
+    expect(testResult.closest('tr')).toHaveClass('channel-test-row');
+    expect(within(testResult).getByText('失败')).toBeInTheDocument();
+    expect(screen.queryByText('最近一次测试')).not.toBeInTheDocument();
     expect(screen.queryByDisplayValue(SECRET_PRIMARY)).not.toBeInTheDocument();
 
     const testCalls = callsFor(fetchMock, '/admin/api/debug/channels/1/test', 'POST');
@@ -486,7 +929,7 @@ describe('渠道页：启停、删除与测试', () => {
     expect(JSON.parse(String(testCalls[0]?.[1]?.body))).toEqual({});
 
     // 测试结果刷新列表：健康状态由正常变为异常。
-    expect(await screen.findByText('异常')).toBeInTheDocument();
+    expect(await screen.findByText('本次失败')).toBeInTheDocument();
     await waitFor(() => {
       expect(screen.getByRole('button', { name: '测试渠道 codex-primary' })).toBeEnabled();
     });
@@ -499,6 +942,15 @@ describe('渠道页：启停、删除与测试', () => {
     expect(await screen.findByText('服务器暂时不可用，请稍后重试。')).toBeInTheDocument();
     expect(screen.queryByDisplayValue(SECRET_PRIMARY)).not.toBeInTheDocument();
     expect(screen.getByText(PRIMARY.key_mask)).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: '编辑渠道 codex-primary' }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.change(within(dialog).getByLabelText('Base URL'), {
+      target: { value: 'https://updated.example.com/v1' },
+    });
+    await user.click(within(dialog).getByRole('button', { name: '保存连接配置' }));
+    await within(dialog).findByText('连接配置已保存，现在可获取或测试模型。');
+    expect(screen.queryByText('服务器暂时不可用，请稍后重试。')).not.toBeInTheDocument();
   });
 
   it('初始化 401 时跳转登录且不渲染渠道内容', async () => {
@@ -510,5 +962,64 @@ describe('渠道页：启停、删除与测试', () => {
     expect(redirectSpy).toHaveBeenCalled();
     expect(screen.queryByRole('button', { name: '新建渠道' })).not.toBeInTheDocument();
     expect(screen.queryByRole('table')).not.toBeInTheDocument();
+  });
+});
+
+
+describe('渠道页：模型发现与内嵌模型', () => {
+  it('新建渠道可从上游拉取模型并在保存时一起提交', async () => {
+    const backend = createBackend([], {});
+    backend.setDiscoveryModels(['gpt-5', 'o3']);
+    const fetchMock = installFetch(backend.handler);
+    const user = userEvent.setup();
+
+    render(<ChannelsPage />);
+    await screen.findByText('尚未配置渠道');
+    await user.click(screen.getByRole('button', { name: '添加第一个渠道' }));
+    await user.selectOptions(await screen.findByLabelText('供应商预设'), 'custom-responses');
+
+    await user.type(screen.getByLabelText('渠道名称'), 'relay');
+    await user.type(screen.getByLabelText('Base URL'), 'https://relay.example.com/v1');
+    await user.type(screen.getByLabelText('上游 Key'), 'sk-relay-model');
+    expect(screen.getByText('高级设置')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: '从上游获取模型' }));
+    expect(await screen.findByText('已从上游获取 2 个模型。')).toBeInTheDocument();
+    await user.click(screen.getByRole('checkbox', { name: '选择模型 gpt-5' }));
+    await user.click(screen.getByRole('button', { name: '创建渠道' }));
+
+    expect(
+      await screen.findByText('渠道「relay」已创建，并添加 1 个模型。'),
+    ).toBeInTheDocument();
+    const post = callsFor(fetchMock, '/admin/api/channels', 'POST')[0];
+    expect(JSON.parse(String(post?.[1]?.body))).toMatchObject({
+      name: 'relay',
+      base_url: 'https://relay.example.com/v1',
+      protocol: 'openai_responses',
+      key: 'sk-relay-model',
+      models: ['gpt-5'],
+    });
+    const preview = callsFor(fetchMock, '/admin/api/channels/preview-models', 'POST')[0];
+    expect(JSON.parse(String(preview?.[1]?.body))).toEqual({
+      base_url: 'https://relay.example.com/v1',
+      protocol: 'openai_responses',
+      key: 'sk-relay-model',
+    });
+  });
+
+  it('从渠道列表直接定位同页模型，连接表单仍可见', async () => {
+    const backend = createBackend([PRIMARY], { 1: SECRET_PRIMARY });
+    installFetch(backend.handler);
+    const user = userEvent.setup();
+
+    render(<ChannelsPage />);
+    await screen.findByText(PRIMARY.key_mask);
+    await user.click(screen.getByRole('button', { name: '管理渠道 codex-primary 的模型' }));
+
+    const dialog = await screen.findByRole('dialog', { name: '编辑渠道：codex-primary' });
+    expect(within(dialog).queryByRole('tab')).not.toBeInTheDocument();
+    expect(within(dialog).getByLabelText('Base URL')).toHaveValue(PRIMARY.base_url);
+    expect(within(dialog).getByRole('region', { name: '支持模型配置' })).toHaveFocus();
+    expect(await within(dialog).findByText('该渠道还没有模型。先同步上游或手动添加。')).toBeInTheDocument();
   });
 });

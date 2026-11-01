@@ -41,8 +41,11 @@ const (
 // 稳定的调度错误。调用方（gateway）只依赖 errors.Is 判断并映射到入站协议
 // 的错误 envelope，不解析错误文本。
 var (
-	// ErrNoCandidates 表示没有启用、协议匹配且未熔断的候选渠道。
+	// ErrNoCandidates 表示没有启用、协议匹配的候选渠道。
 	ErrNoCandidates = errors.New("routing: 没有可用候选渠道")
+	// ErrAllCircuitsOpen 表示存在启用且协议匹配的候选，但全部因熔断被排除；
+	// 这是暂时性错误，调用方应返回 503 而不是 404。
+	ErrAllCircuitsOpen = errors.New("routing: 所有候选渠道均已熔断")
 	// ErrChannelCapacity 表示所有候选渠道都已达到 max_concurrency，
 	// 且等待超过 CapacityWait。
 	ErrChannelCapacity = errors.New("routing: 渠道并发容量已满")
@@ -92,6 +95,9 @@ type Options struct {
 	Circuit  CircuitOptions
 	// CapacityWait 是全部候选满载时的最长等待时间。
 	CapacityWait time.Duration
+	// DisableCapacityWait 为 true 时不做任何等待：所有候选满载立即返回
+	// ErrChannelCapacity。用于配置 GATEWAY_CAPACITY_WAIT=0 的快速失败语义。
+	DisableCapacityWait bool
 	// CapacityPoll 是等待槽位时的轮询间隔；大于 CapacityWait 时按等待时间截断。
 	CapacityPoll time.Duration
 }
@@ -109,6 +115,7 @@ type Scheduler struct {
 
 	capacityWait time.Duration
 	capacityPoll time.Duration
+	noWait       bool
 	now          func() time.Time
 }
 
@@ -119,6 +126,33 @@ type Scheduler struct {
 type Candidate struct {
 	Route   store.ModelRoute
 	Channel store.Channel
+	ticket  *dispatchTicket
+}
+
+const (
+	FailureScopeRequest = "request"
+	FailureScopeModel   = "model"
+	FailureScopeChannel = "channel"
+	MaxRetryAfter       = 5 * time.Minute
+)
+
+// Failure 的 Message 必须是脱敏短文案，不能包含 Key、URL 或上游响应体。
+type Failure struct {
+	Scope      string
+	Status     int
+	Message    string
+	RetryAfter time.Duration
+}
+
+// RuntimeSnapshot 分开呈现渠道级故障与模型局部故障；读取不占恢复许可。
+type RuntimeSnapshot struct {
+	State           string
+	InUse           int
+	Limit           int
+	OpenUntil       *time.Time
+	LastError       string
+	ModelCooldowns  int
+	ModelRecovering int
 }
 
 // New 构造调度器。Routes/Channels 缺失时返回错误。
@@ -154,6 +188,7 @@ func New(opts Options) (*Scheduler, error) {
 		breaker:      newCircuitBreaker(opts.Circuit, now),
 		capacityWait: capacityWait,
 		capacityPoll: capacityPoll,
+		noWait:       opts.DisableCapacityWait,
 		now:          now,
 	}, nil
 }
@@ -168,6 +203,16 @@ func New(opts Options) (*Scheduler, error) {
 func (s *Scheduler) Candidates(
 	ctx context.Context,
 	clientModel, protocol string,
+) ([]Candidate, error) {
+	return s.candidates(ctx, clientModel, protocol, true)
+}
+
+// candidates 是 Candidates 的实现；respectCircuit 为 false 时忽略熔断状态，
+// 仅用于区分“没有配置候选”和“候选全部熔断”。
+func (s *Scheduler) candidates(
+	ctx context.Context,
+	clientModel, protocol string,
+	respectCircuit bool,
 ) ([]Candidate, error) {
 	if s == nil || s.routes == nil || s.channels == nil {
 		return nil, errors.New("routing: 调度器未初始化")
@@ -202,7 +247,7 @@ func (s *Scheduler) Candidates(
 		if !channel.Enabled || channel.Protocol != protocol {
 			continue
 		}
-		if !s.breaker.allow(channel.ID) {
+		if respectCircuit && !s.breaker.allow(Candidate{Route: route, Channel: channel}) {
 			continue
 		}
 		if _, duplicate := seen[channel.ID]; duplicate {
@@ -219,9 +264,10 @@ func (s *Scheduler) Candidates(
 // Acquire 按候选顺序选择第一个有空闲并发槽位的渠道，并返回占用的槽位。
 //
 // 渠道满载时先尝试下一个候选；全部候选都满载时每 CapacityPoll 重新尝试，
-// 最多等待 CapacityWait。等待期间获得槽位则继续请求；超时返回
-// ErrChannelCapacity；客户端取消返回 ctx.Err()。没有可用候选时返回
-// ErrNoCandidates，不等待。
+// 最多等待 CapacityWait（DisableCapacityWait 时立即返回）。等待期间获得
+// 槽位则继续请求；超时返回 ErrChannelCapacity；客户端取消返回 ctx.Err()。
+// 没有可用候选时返回 ErrNoCandidates；候选全部熔断时返回
+// ErrAllCircuitsOpen，均不等待。
 //
 // 成功获得槽位后会以 best-effort 方式更新该渠道的 last_used_at；写入失败
 // 不阻断请求（LRU 只影响同优先级渠道的相对顺序）。调用方必须在使用完
@@ -249,26 +295,18 @@ func (s *Scheduler) AcquireExcluding(
 		return Candidate{}, nil, err
 	}
 
-	candidates, err := s.Candidates(ctx, clientModel, protocol)
+	protocol = strings.TrimSpace(protocol)
+	candidates, err := s.candidates(ctx, clientModel, protocol, false)
 	if err != nil {
 		return Candidate{}, nil, err
 	}
-	if len(exclude) > 0 {
-		filtered := candidates[:0]
-		for _, candidate := range candidates {
-			if _, skip := exclude[candidate.Channel.ID]; skip {
-				continue
-			}
+	filtered := candidates[:0]
+	for _, candidate := range candidates {
+		if _, skip := exclude[candidate.Channel.ID]; !skip {
 			filtered = append(filtered, candidate)
 		}
-		candidates = filtered
 	}
-	if len(candidates) == 0 {
-		return Candidate{}, nil, ErrNoCandidates
-	}
-
-	// 等待期间复用同一份候选快照：满载时每 25ms 查询 SQLite 会放大数据库
-	// 压力；槽位释放后按原排序继续即可。熔断状态仍在每次尝试前重新检查。
+	candidates = filtered
 	deadline := time.NewTimer(s.capacityWait)
 	defer deadline.Stop()
 
@@ -276,20 +314,72 @@ func (s *Scheduler) AcquireExcluding(
 		if err := ctx.Err(); err != nil {
 			return Candidate{}, nil, err
 		}
-		for _, candidate := range candidates {
-			// 等待期间熔断状态可能变化；每次尝试前重新检查。
-			if !s.breaker.allow(candidate.Channel.ID) {
+		capacityBlocked := false
+		for i := range candidates {
+			candidate := &candidates[i]
+			if !candidate.Channel.Enabled {
 				continue
 			}
-			slot, acquired := s.limiter.TryAcquire(
-				candidate.Channel.ID, candidate.Channel.MaxConcurrency)
-			if !acquired {
+			if !s.breaker.allow(*candidate) {
 				continue
+			}
+			slot, acquired := s.limiter.TryAcquire(candidate.Channel.ID, candidate.Channel.MaxConcurrency)
+			if !acquired {
+				capacityBlocked = true
+				continue
+			}
+			// 仅预留到槽位的候选重新读取配置，避免满载时反复扫描数据库。
+			fresh, getErr := s.channels.Get(ctx, candidate.Channel.ID)
+			if getErr != nil {
+				slot.Release()
+				if errors.Is(getErr, store.ErrChannelNotFound) {
+					candidate.Channel.Enabled = false
+					continue
+				}
+				return Candidate{}, nil, fmt.Errorf("routing: 复查渠道失败：%w", getErr)
+			}
+			if !fresh.Enabled || fresh.Protocol != protocol || fresh.ConnectionRevision != candidate.Channel.ConnectionRevision {
+				slot.Release()
+				candidate.Channel.Enabled = false
+				continue
+			}
+			candidate.Channel = fresh
+			if !s.limiter.confirmLimit(fresh.ID, fresh.MaxConcurrency) {
+				slot.Release()
+				capacityBlocked = true
+				continue
+			}
+			ticket := s.breaker.acquire(*candidate)
+			if ticket == nil {
+				slot.Release()
+				continue
+			}
+			candidate.ticket = ticket
+			slot.onRelease = func() { s.breaker.cancel(ticket) }
+			if err := ctx.Err(); err != nil {
+				slot.Release()
+				return Candidate{}, nil, err
 			}
 			s.touchLastUsed(ctx, candidate.Channel.ID)
-			return candidate, slot, nil
+			if err := ctx.Err(); err != nil {
+				slot.Release()
+				return Candidate{}, nil, err
+			}
+			return *candidate, slot, nil
 		}
-
+		configured := false
+		for _, candidate := range candidates {
+			configured = configured || candidate.Channel.Enabled
+		}
+		if !configured {
+			return Candidate{}, nil, ErrNoCandidates
+		}
+		if !capacityBlocked {
+			return Candidate{}, nil, ErrAllCircuitsOpen
+		}
+		if s.noWait {
+			return Candidate{}, nil, ErrChannelCapacity
+		}
 		poll := time.NewTimer(s.capacityPoll)
 		select {
 		case <-ctx.Done():
@@ -297,31 +387,50 @@ func (s *Scheduler) AcquireExcluding(
 			return Candidate{}, nil, ctx.Err()
 		case <-deadline.C:
 			poll.Stop()
-			return Candidate{}, nil, fmt.Errorf(
-				"%w：%d 个候选渠道均无空闲并发槽位", ErrChannelCapacity, len(candidates))
+			return Candidate{}, nil, ErrChannelCapacity
 		case <-poll.C:
 		}
 	}
 }
 
-// RecordSuccess 清除渠道的熔断状态与 last_error。
-func (s *Scheduler) RecordSuccess(channelID int64) {
-	if s == nil || s.breaker == nil {
-		return
+// RecordSuccess 只接受本次派发的票据；必须在 slot.Release 前调用。
+func (s *Scheduler) RecordSuccess(candidate Candidate) {
+	if s.validFeedback(candidate) {
+		s.breaker.finish(candidate.ticket, nil)
 	}
-	s.breaker.succeed(channelID)
 }
 
-// RecordFailure 记录一次上游失败并按状态码打开熔断。
-//
-// 401/403 打开 5m，429 打开 10s，5xx（含 529）打开 20s；其他状态码
-// （例如 400）不熔断。message 必须是已脱敏的短文案，调用方不得传入上游
-// 响应 body、Key 或完整 URL。返回值表示是否触发了熔断。
-func (s *Scheduler) RecordFailure(channelID int64, status int, message string) bool {
-	if s == nil || s.breaker == nil {
+// RecordFailure 记录局部或渠道故障，返回是否更新冷却；请求错误不熔断。
+func (s *Scheduler) RecordFailure(candidate Candidate, failure Failure) bool {
+	if !s.validFeedback(candidate) {
 		return false
 	}
-	return s.breaker.fail(channelID, status, message)
+	return s.breaker.finish(candidate.ticket, &failure)
+}
+
+func (s *Scheduler) validFeedback(candidate Candidate) bool {
+	if s == nil || s.breaker == nil || candidate.ticket == nil || candidate.ticket.owner != s.breaker {
+		return false
+	}
+	ticket := candidate.ticket
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	channel, err := s.channels.Get(ctx, ticket.channelID)
+	if err != nil || channel.ConnectionRevision != ticket.revision {
+		s.breaker.cancel(ticket)
+		return false
+	}
+	return true
+}
+
+// Runtime 返回只读快照；到期但尚未成功恢复仍显示 recovering。
+func (s *Scheduler) Runtime(channel store.Channel) RuntimeSnapshot {
+	if s == nil || s.breaker == nil {
+		return RuntimeSnapshot{State: "ready", Limit: channel.MaxConcurrency}
+	}
+	snapshot := s.breaker.runtime(channel)
+	snapshot.InUse = s.limiter.InUse(channel.ID)
+	return snapshot
 }
 
 // CircuitSnapshot 是渠道熔断状态的内存快照。
@@ -386,19 +495,47 @@ func compareLastUsed(left, right *time.Time) int {
 	}
 }
 
-// circuitBreaker 是进程内熔断状态。
+// circuitBreaker 用同一把锁维护两级状态和恢复许可。
 type circuitBreaker struct {
 	mu     sync.Mutex
-	states map[int64]circuitState
+	states map[int64]*channelCircuit
 	now    func() time.Time
 	auth   time.Duration
 	rate   time.Duration
 	server time.Duration
 }
 
+type modelCircuitKey struct {
+	protocol string
+	model    string
+}
+
+type channelCircuit struct {
+	revision int64
+	channel  circuitState
+	models   map[modelCircuitKey]*circuitState
+}
+
 type circuitState struct {
-	openUntil time.Time
-	lastError string
+	generation uint64
+	resolved   uint64
+	openUntil  time.Time
+	lastError  string
+	probe      *dispatchTicket
+}
+
+type dispatchTicket struct {
+	owner             *circuitBreaker
+	channelID         int64
+	revision          int64
+	model             modelCircuitKey
+	channelGeneration uint64
+	modelGeneration   uint64
+	done              bool // guarded by owner.mu; copies of Candidate share completion
+}
+
+func candidateModelKey(candidate Candidate) modelCircuitKey {
+	return modelCircuitKey{protocol: candidate.Channel.Protocol, model: candidate.Route.UpstreamModel}
 }
 
 // newCircuitBreaker 构造熔断器；窗口为零或负值时使用默认值。
@@ -419,7 +556,7 @@ func newCircuitBreaker(opts CircuitOptions, now func() time.Time) *circuitBreake
 		server = DefaultServerErrorCircuitWindow
 	}
 	return &circuitBreaker{
-		states: make(map[int64]circuitState),
+		states: make(map[int64]*channelCircuit),
 		now:    now,
 		auth:   auth,
 		rate:   rate,
@@ -427,52 +564,137 @@ func newCircuitBreaker(opts CircuitOptions, now func() time.Time) *circuitBreake
 	}
 }
 
-// allow 报告渠道当前是否允许调度；过期的熔断窗口会被清除。
-func (b *circuitBreaker) allow(channelID int64) bool {
-	if b == nil {
-		return true
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	state, ok := b.states[channelID]
-	if !ok || state.openUntil.IsZero() {
-		return true
-	}
-	if b.now().Before(state.openUntil) {
-		return false
-	}
-	state.openUntil = time.Time{}
-	b.states[channelID] = state
-	return true
+func (state *circuitState) available(now time.Time) bool {
+	return state == nil || state.openUntil.IsZero() || (!now.Before(state.openUntil) && state.probe == nil)
 }
 
-// succeed 清除渠道的熔断状态与 last_error。
-func (b *circuitBreaker) succeed(channelID int64) {
-	if b == nil {
+// allow 不改变状态，也不占恢复许可。
+func (b *circuitBreaker) allow(candidate Candidate) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	state := b.states[candidate.Channel.ID]
+	if state == nil || state.revision < candidate.Channel.ConnectionRevision {
+		return true
+	}
+	if state.revision != candidate.Channel.ConnectionRevision {
+		return false
+	}
+	now := b.now()
+	return state.channel.available(now) && state.models[candidateModelKey(candidate)].available(now)
+}
+
+func (b *circuitBreaker) acquire(candidate Candidate) *dispatchTicket {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	id, revision := candidate.Channel.ID, candidate.Channel.ConnectionRevision
+	state := b.states[id]
+	if state != nil && state.revision > revision {
+		return nil
+	}
+	if state == nil || state.revision != revision {
+		state = &channelCircuit{revision: revision, models: make(map[modelCircuitKey]*circuitState)}
+		b.states[id] = state
+	}
+	key := candidateModelKey(candidate)
+	model := state.models[key]
+	now := b.now()
+	if !state.channel.available(now) || !model.available(now) {
+		return nil
+	}
+	if model == nil {
+		model = &circuitState{}
+		state.models[key] = model
+	}
+	ticket := &dispatchTicket{owner: b, channelID: id, revision: revision, model: key,
+		channelGeneration: state.channel.generation, modelGeneration: model.generation}
+	if !state.channel.openUntil.IsZero() {
+		state.channel.probe = ticket
+	}
+	if !model.openUntil.IsZero() {
+		model.probe = ticket
+	}
+	return ticket
+}
+
+func (b *circuitBreaker) cancel(ticket *dispatchTicket) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if ticket.done {
 		return
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	delete(b.states, channelID)
+	ticket.done = true
+	if state := b.states[ticket.channelID]; state != nil && state.revision == ticket.revision {
+		releaseProbe(&state.channel, ticket)
+		releaseProbe(state.models[ticket.model], ticket)
+	}
 }
 
-// fail 按状态码打开熔断；返回状态码是否属于熔断范围。
-func (b *circuitBreaker) fail(channelID int64, status int, message string) bool {
-	if b == nil {
-		return false
+func releaseProbe(state *circuitState, ticket *dispatchTicket) {
+	if state != nil && state.probe == ticket {
+		state.probe = nil
 	}
-	window, tripped := b.windowFor(status)
-	if !tripped {
-		return false
-	}
+}
 
+func resolveCircuit(state *circuitState, generation uint64, ticket *dispatchTicket) {
+	if state.generation != generation || (!state.openUntil.IsZero() && state.probe != ticket) {
+		return
+	}
+	if !state.openUntil.IsZero() {
+		state.generation++
+		state.resolved = state.generation
+	}
+	state.openUntil = time.Time{}
+	state.lastError = ""
+	state.probe = nil
+}
+
+func (b *circuitBreaker) finish(ticket *dispatchTicket, failure *Failure) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.states[channelID] = circuitState{
-		openUntil: b.now().Add(window),
-		lastError: message,
+	if ticket.done {
+		return false
 	}
+	ticket.done = true
+	state := b.states[ticket.channelID]
+	if state == nil || state.revision != ticket.revision {
+		return false
+	}
+	model := state.models[ticket.model]
+	defer releaseProbe(&state.channel, ticket)
+	defer releaseProbe(model, ticket)
+	if failure == nil {
+		// 任一级出现更新的故障，都不能让较早派发的成功清除状态。
+		if state.channel.generation == ticket.channelGeneration && model.generation == ticket.modelGeneration {
+			resolveCircuit(&state.channel, ticket.channelGeneration, ticket)
+			resolveCircuit(model, ticket.modelGeneration, ticket)
+		}
+		return false
+	}
+	if failure.Scope == FailureScopeRequest {
+		return false
+	}
+	window, trips := b.windowFor(failure.Status)
+	target, generation := &state.channel, ticket.channelGeneration
+	if failure.Scope == FailureScopeModel {
+		target, generation = model, ticket.modelGeneration
+		if !trips {
+			window, trips = b.server, true
+		}
+	}
+	// 已经由恢复请求确认过的旧尝试，不能重新打开状态。
+	if !trips || generation < target.resolved || ticket.channelGeneration < state.channel.resolved {
+		return false
+	}
+	if failure.RetryAfter > 0 {
+		window = min(failure.RetryAfter, MaxRetryAfter)
+	}
+	until := b.now().Add(window)
+	if until.After(target.openUntil) {
+		target.openUntil = until
+	}
+	target.generation++
+	target.lastError = failure.Message
+	target.probe = nil
 	return true
 }
 
@@ -483,6 +705,8 @@ func (b *circuitBreaker) windowFor(status int) (time.Duration, bool) {
 	case status == 429:
 		return b.rate, true
 	case status >= 500 && status <= 599:
+		return b.server, true
+	case status <= 0:
 		return b.server, true
 	default:
 		return 0, false
@@ -501,8 +725,44 @@ func (b *circuitBreaker) snapshot(channelID int64) CircuitSnapshot {
 		return CircuitSnapshot{}
 	}
 	return CircuitSnapshot{
-		Open:      !state.openUntil.IsZero() && b.now().Before(state.openUntil),
-		OpenUntil: state.openUntil,
-		LastError: state.lastError,
+		Open:      !state.channel.openUntil.IsZero() && b.now().Before(state.channel.openUntil),
+		OpenUntil: state.channel.openUntil,
+		LastError: state.channel.lastError,
 	}
+}
+
+func circuitPhase(state *circuitState, now time.Time) string {
+	if state == nil || state.openUntil.IsZero() {
+		return "ready"
+	}
+	if now.Before(state.openUntil) {
+		return "cooldown"
+	}
+	return "recovering"
+}
+
+func (b *circuitBreaker) runtime(channel store.Channel) RuntimeSnapshot {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	snapshot := RuntimeSnapshot{State: "ready", Limit: channel.MaxConcurrency}
+	state := b.states[channel.ID]
+	if state == nil || state.revision != channel.ConnectionRevision {
+		return snapshot
+	}
+	now := b.now()
+	snapshot.State = circuitPhase(&state.channel, now)
+	snapshot.LastError = state.channel.lastError
+	if !state.channel.openUntil.IsZero() {
+		until := state.channel.openUntil
+		snapshot.OpenUntil = &until
+	}
+	for _, model := range state.models {
+		switch circuitPhase(model, now) {
+		case "cooldown":
+			snapshot.ModelCooldowns++
+		case "recovering":
+			snapshot.ModelRecovering++
+		}
+	}
+	return snapshot
 }

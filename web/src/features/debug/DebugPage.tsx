@@ -8,6 +8,8 @@ import {
 } from 'react';
 
 import { ApiError, apiRequest, isUnauthorizedError } from '../../lib/api';
+import { checkStatusLabel, INCONCLUSIVE_NOTE } from '../channels/ChannelTestResultView';
+import type { ChannelTestResult } from '../channels/types';
 
 /**
  * 调试页（T22）。
@@ -40,18 +42,7 @@ interface ModelsResponse {
 }
 
 /** DebugTestResult 与后端 debugTestResponse 对应；error 已脱敏。 */
-export interface DebugTestResult {
-  status: string;
-  http_status: number;
-  latency_ms: number;
-  error?: string;
-  channel_id: number;
-  channel_name: string;
-  model?: string;
-  upstream_model: string;
-  tested_at: string;
-  request_link: string;
-}
+export type DebugTestResult = ChannelTestResult;
 
 type TestKind = 'channel' | 'model';
 
@@ -289,7 +280,7 @@ export function DebugPage(): ReactNode {
         <div>
           <h2>调试</h2>
           <p>
-            验证渠道连通性、模型路由与脱敏错误。测试只发送最小 ping 请求，不携带任何用户
+            检查指定模型的有效生成、模型映射与脱敏错误。测试只发送最小 ping 请求，不携带任何用户
             prompt。
           </p>
         </div>
@@ -298,7 +289,7 @@ export function DebugPage(): ReactNode {
 
       <p className="form-note" role="note">
         每次测试都会向上游发送最小请求（输出上限 16 tokens），消耗少量上游 tokens，并将结果写入
-        渠道健康状态。
+        最近检查。仅代表本次模型、协议与连接版本，不代表全部模型或全部能力，也不等同当前运行状态。
       </p>
 
       {optionsError === null ? null : (
@@ -318,7 +309,7 @@ export function DebugPage(): ReactNode {
 
       <section className="panel" aria-labelledby="debug-channel-title">
         <div className="panel-header">
-          <h2 id="debug-channel-title">渠道连通性测试</h2>
+          <h2 id="debug-channel-title">渠道有效生成检查</h2>
           <span className="badge badge--muted">
             {optionsLoading ? '正在加载…' : `${channels.length} 个渠道`}
           </span>
@@ -444,7 +435,7 @@ export function DebugPage(): ReactNode {
           {outcome === null ? null : (
             <span className={healthy ? 'badge' : 'badge badge--muted'}>
               {outcome.kind === 'channel' ? '渠道测试' : '模型测试'} ·{' '}
-              {healthy ? '正常' : '失败'}
+              {checkStatusLabel(outcome.result.status)}
             </span>
           )}
         </div>
@@ -470,10 +461,10 @@ export function DebugPage(): ReactNode {
                 <span>状态</span>
                 <code
                   style={{
-                    color: healthy ? 'var(--color-success)' : 'var(--color-danger)',
+                    color: healthy ? 'var(--color-success)' : result.status === 'unhealthy' ? 'var(--color-danger)' : undefined,
                   }}
                 >
-                  {healthy ? 'healthy' : 'unhealthy'}
+                  {['healthy', 'unhealthy', 'inconclusive'].includes(result.status) ? result.status : 'unknown'}
                 </code>
               </li>
               <li>
@@ -481,9 +472,14 @@ export function DebugPage(): ReactNode {
                 <code>{result.http_status === 0 ? '—' : result.http_status}</code>
               </li>
               <li>
-                <span>延迟</span>
+                <span>响应头耗时</span>
                 <code>{result.latency_ms} ms</code>
               </li>
+              <li><span>总耗时</span><code>{result.duration_ms === undefined ? '未知' : `${result.duration_ms} ms`}</code></li>
+              <li><span>协议</span><code>{result.protocol || '未知'}</code></li>
+              <li><span>连接版本</span><code>{result.connection_revision ? `v${result.connection_revision}` : '未知'}</code></li>
+              <li><span>检查类型</span><code>{result.kind === 'generation' ? '有效生成' : '未知'}</code></li>
+              <li><span>错误码</span><code>{result.error_code || '—'}</code></li>
               <li>
                 <span>渠道</span>
                 <code>
@@ -502,8 +498,9 @@ export function DebugPage(): ReactNode {
               )}
             </ul>
 
+            {result.status === 'inconclusive' ? <p className="form-note">{INCONCLUSIVE_NOTE}</p> : null}
             {result.error === undefined || result.error === '' ? null : (
-              <p className="form-error" role="alert" style={RESULT_ACTION_STYLE}>
+              <p className={result.status === 'unhealthy' ? 'form-error' : 'form-note'} role="alert" style={RESULT_ACTION_STYLE}>
                 {result.error}
               </p>
             )}

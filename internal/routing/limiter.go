@@ -83,6 +83,21 @@ func (l *Limiter) InUse(channelID int64) int {
 	return len(semaphore.slots)
 }
 
+// confirmLimit 在读取最新配置后复核已预留的槽位，缩容不能放行超额请求。
+func (l *Limiter) confirmLimit(channelID int64, limit int) bool {
+	if limit < 1 {
+		limit = 1
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	semaphore := l.channels[channelID]
+	if semaphore == nil {
+		return false
+	}
+	semaphore.resize(limit)
+	return len(semaphore.slots) <= limit
+}
+
 // resize 应用新的上限。扩容时保留已占用 token；缩容只更新 target。
 func (s *channelSemaphore) resize(limit int) {
 	s.target = limit
@@ -137,6 +152,7 @@ func (l *Limiter) release(channelID int64) {
 type Slot struct {
 	limiter   *Limiter
 	channelID int64
+	onRelease func()
 	once      sync.Once
 }
 
@@ -146,6 +162,9 @@ func (s *Slot) Release() {
 		return
 	}
 	s.once.Do(func() {
+		if s.onRelease != nil {
+			s.onRelease()
+		}
 		s.limiter.release(s.channelID)
 	})
 }

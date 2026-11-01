@@ -84,6 +84,13 @@ function hasRequest(fetchMock: FetchMock, url: string, method: string): boolean 
   return callsFor(fetchMock, url, method).length > 0;
 }
 
+async function expandModel(user: ReturnType<typeof userEvent.setup>, clientModel: string) {
+  const group = await screen.findByRole('region', { name: `${clientModel} 模型路由` });
+  await user.click(within(group).getByText('展开映射明细'));
+  await within(group).findByRole('table', { name: `${clientModel} 的映射明细` });
+  return group;
+}
+
 function rowOf(button: HTMLElement): HTMLElement {
   const row = button.closest('tr');
   if (!(row instanceof HTMLElement)) {
@@ -95,7 +102,7 @@ function rowOf(button: HTMLElement): HTMLElement {
 /**
  * createBackend 模拟 T09 后端：列表、模型去重、创建、PATCH、删除与唯一约束。
  *
- * 模型列表由启用映射实时推导，因此启用/禁用后刷新 /admin/api/models 时，
+ * 模型列表由启用映射及启用渠道实时推导，因此启用/禁用后刷新 /admin/api/models 时，
  * 测试能观察到“模型不再出现”的行为。
  */
 function createBackend(initialRoutes: ModelRoute[], channels: ChannelSummary[]) {
@@ -103,7 +110,11 @@ function createBackend(initialRoutes: ModelRoute[], channels: ChannelSummary[]) 
   let nextID = 100;
 
   const deriveModels = () =>
-    Array.from(new Set(routes.filter((route) => route.enabled).map((route) => route.client_model)))
+    Array.from(new Set(routes.filter(
+      (route) => route.enabled && channels.some(
+        (channel) => channel.id === route.channel_id && channel.enabled,
+      ),
+    ).map((route) => route.client_model)))
       .sort((left, right) => left.localeCompare(right));
 
   const conflict = () =>
@@ -220,7 +231,7 @@ describe('模型映射页', () => {
 
     await user.click(screen.getByRole('button', { name: '创建第一条映射' }));
 
-    expect(screen.getByRole('heading', { name: '新建映射' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '新建手工映射' })).toBeInTheDocument();
     expect(screen.getByLabelText('客户端模型')).toHaveAttribute(
       'list',
       'mapping-client-model-options',
@@ -245,6 +256,7 @@ describe('模型映射页', () => {
       enabled: true,
     });
 
+    const group = await expandModel(user, 'gpt-5-codex');
     const editButton = await screen.findByRole('button', {
       name: '编辑映射 gpt-5-codex → codex-primary',
     });
@@ -255,14 +267,15 @@ describe('模型映射页', () => {
     expect(within(row).getByText('7')).toBeInTheDocument();
     expect(within(row).getByText('启用')).toBeInTheDocument();
     expect(row.querySelector(`time[datetime="${UPDATED_AT}"]`)).not.toBeNull();
-    expect(within(screen.getByRole('table')).getByText('1 条映射')).toBeInTheDocument();
+    expect(within(group).getByText('已配置 1 条')).toBeInTheDocument();
+    expect(within(group).getByText('可用 1 条')).toBeInTheDocument();
 
     // 创建后刷新 /admin/api/models：启用的模型应立即可用。
     expect(hasRequest(fetchMock, '/admin/api/models', 'GET')).toBe(true);
     expect(
       await screen.findByText('gpt-5-codex', { selector: '.badge' }),
     ).toBeInTheDocument();
-    expect(screen.queryByText(/暂无启用的客户端模型/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/暂无已发布的客户端模型/)).not.toBeInTheDocument();
   });
 
   it('重复客户端模型+渠道返回冲突提示，不新增行且保留表单', async () => {
@@ -272,8 +285,8 @@ describe('模型映射页', () => {
 
     render(<MappingsPage />);
 
-    await screen.findByRole('button', { name: '编辑映射 gpt-5-codex → codex-primary' });
-    await user.click(screen.getByRole('button', { name: '新建映射' }));
+    await expandModel(user, 'gpt-5-codex');
+    await user.click(screen.getByRole('button', { name: '高级手工映射' }));
 
     await user.type(screen.getByLabelText('客户端模型'), 'gpt-5-codex');
     await user.selectOptions(screen.getByLabelText('渠道'), '1');
@@ -284,7 +297,7 @@ describe('模型映射页', () => {
       await screen.findByText(/同一客户端模型与渠道的映射已存在/),
     ).toBeInTheDocument();
     expect(hasRequest(fetchMock, '/admin/api/model-routes', 'POST')).toBe(true);
-    expect(screen.getByRole('heading', { name: '新建映射' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: '新建手工映射' })).toBeInTheDocument();
     expect(screen.queryByText('映射已创建。')).not.toBeInTheDocument();
     expect(screen.queryByText('another-upstream')).not.toBeInTheDocument();
     expect(screen.getAllByRole('button', { name: /^编辑映射 / })).toHaveLength(1);
@@ -298,11 +311,12 @@ describe('模型映射页', () => {
 
     render(<MappingsPage />);
 
+    await expandModel(user, 'gpt-5-codex');
     const row = rowOf(
       await screen.findByRole('button', { name: '编辑映射 gpt-5-codex → codex-primary' }),
     );
     expect(within(row).getByText('启用')).toBeInTheDocument();
-    expect(screen.queryByText(/暂无启用的客户端模型/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/暂无已发布的客户端模型/)).not.toBeInTheDocument();
 
     const modelListCallsBefore = callsFor(fetchMock, '/admin/api/models', 'GET').length;
     await user.click(
@@ -319,13 +333,15 @@ describe('模型映射页', () => {
       screen.getByRole('button', { name: '编辑映射 gpt-5-codex → codex-primary' }),
     );
     expect(within(disabledRow).getByText('禁用')).toBeInTheDocument();
-    expect(screen.getByText('全部禁用')).toBeInTheDocument();
+    expect(screen.getByText('全部停用')).toBeInTheDocument();
+    expect(screen.getByText('已配置 1 条')).toBeInTheDocument();
+    expect(screen.getByText('可用 0 条')).toBeInTheDocument();
     expect(
       screen.getByRole('button', { name: '启用映射 gpt-5-codex → codex-primary' }),
     ).toBeInTheDocument();
 
     await waitFor(() => {
-      expect(screen.getByText(/暂无启用的客户端模型/)).toBeInTheDocument();
+      expect(screen.getByText(/暂无已发布的客户端模型/)).toBeInTheDocument();
     });
     expect(callsFor(fetchMock, '/admin/api/models', 'GET').length).toBeGreaterThan(
       modelListCallsBefore,
@@ -333,9 +349,8 @@ describe('模型映射页', () => {
     expect(backend.deriveModels()).toEqual([]);
   });
 
-  it('按客户端模型分组展示，并支持按模型/渠道筛选', async () => {
+  it('默认聚合且不挂载明细，展开后按优先级与 id 排序，筛选只统计匹配路由', async () => {
     const routes: ModelRoute[] = [
-      CODEX_ROUTE,
       {
         ...CODEX_ROUTE,
         id: 2,
@@ -343,6 +358,7 @@ describe('模型映射页', () => {
         upstream_model: 'gpt-5.1-codex-chat',
         priority: 5,
       },
+      CODEX_ROUTE,
       {
         id: 3,
         client_model: 'gpt-4o-mini',
@@ -353,42 +369,166 @@ describe('模型映射页', () => {
         created_at: CREATED_AT,
         updated_at: UPDATED_AT,
       },
+      {
+        ...CODEX_ROUTE,
+        id: 4,
+        channel_id: 3,
+        upstream_model: 'gpt-5.1-codex-tie',
+        priority: 0,
+      },
     ];
-    const backend = createBackend(routes, [CODEX_CHANNEL, CHAT_CHANNEL]);
+    const thirdChannel = { ...CHAT_CHANNEL, id: 3, name: 'chat-third' };
+    const backend = createBackend(routes, [CODEX_CHANNEL, CHAT_CHANNEL, thirdChannel]);
     installFetch(backend.handler);
     const user = userEvent.setup();
 
     const { container } = render(<MappingsPage />);
 
-    await screen.findByRole('button', { name: '编辑映射 gpt-5-codex → codex-primary' });
-    expect(screen.getAllByRole('button', { name: /^编辑映射 / })).toHaveLength(3);
-    expect(screen.getByText('2 条映射')).toBeInTheDocument();
-    expect(screen.getByText('1 条映射')).toBeInTheDocument();
+    const codexGroup = await screen.findByRole('region', { name: 'gpt-5-codex 模型路由' });
+    const miniGroup = screen.getByRole('region', { name: 'gpt-4o-mini 模型路由' });
+    expect(screen.getAllByRole('heading', { level: 3 }).map((heading) => heading.textContent))
+      .toEqual(['gpt-4o-mini', 'gpt-5-codex']);
+    expect(within(codexGroup).getByText('已配置 3 条')).toBeInTheDocument();
+    expect(within(codexGroup).getByText('可用 3 条')).toBeInTheDocument();
+    expect(within(miniGroup).getByText('已配置 1 条')).toBeInTheDocument();
+    expect(within(codexGroup).getByText('codex-primary · openai_responses')).toBeInTheDocument();
+    expect(within(codexGroup).getByText('chat-backup · openai_chat')).toBeInTheDocument();
+    expect(container.querySelectorAll('details[open]')).toHaveLength(0);
+    expect(container.querySelectorAll('table')).toHaveLength(0);
+    expect(screen.queryByRole('button', { name: /^编辑映射 / })).not.toBeInTheDocument();
+    expect(screen.queryByText('gpt-5.1-codex')).not.toBeInTheDocument();
+
+    await expandModel(user, 'gpt-5-codex');
+    expect(screen.getAllByRole('button', { name: /^编辑映射 / }).map((button) => button.getAttribute('aria-label')))
+      .toEqual([
+        '编辑映射 gpt-5-codex → codex-primary',
+        '编辑映射 gpt-5-codex → chat-third',
+        '编辑映射 gpt-5-codex → chat-backup',
+      ]);
+    expect(within(miniGroup).queryByRole('table')).not.toBeInTheDocument();
+    await user.click(within(codexGroup).getByText('收起映射明细'));
+    await waitFor(() => expect(container.querySelectorAll('table')).toHaveLength(0));
+    await expandModel(user, 'gpt-5-codex');
+    await expandModel(user, 'gpt-4o-mini');
 
     await user.selectOptions(screen.getByLabelText('按客户端模型筛选'), 'gpt-5-codex');
-    expect(screen.getAllByRole('button', { name: /^编辑映射 / })).toHaveLength(2);
-    expect(
-      screen.queryByRole('button', { name: '编辑映射 gpt-4o-mini → chat-backup' }),
-    ).not.toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: /^编辑映射 / })).toHaveLength(3);
+    expect(screen.queryByRole('region', { name: 'gpt-4o-mini 模型路由' })).not.toBeInTheDocument();
 
     await user.selectOptions(screen.getByLabelText('按渠道筛选'), '2');
     expect(screen.getAllByRole('button', { name: /^编辑映射 / })).toHaveLength(1);
-    expect(
-      screen.getByRole('button', { name: '编辑映射 gpt-5-codex → chat-backup' }),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByRole('button', { name: '编辑映射 gpt-5-codex → codex-primary' }),
-    ).not.toBeInTheDocument();
+    expect(within(codexGroup).getByText('已配置 1 条')).toBeInTheDocument();
+    expect(within(codexGroup).getByText('可用 1 条')).toBeInTheDocument();
+    expect(within(codexGroup).getByText('可用协议：openai_chat')).toBeInTheDocument();
+    expect(within(codexGroup).queryByText('codex-primary · openai_responses')).not.toBeInTheDocument();
+    expect(screen.getByText('1 / 4 条映射')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '编辑映射 gpt-5-codex → chat-backup' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '编辑映射 gpt-5-codex → codex-primary' })).not.toBeInTheDocument();
 
     await user.selectOptions(screen.getByLabelText('按客户端模型筛选'), 'all');
+    expect(await screen.findByRole('button', { name: '编辑映射 gpt-4o-mini → chat-backup' })).toBeInTheDocument();
     expect(screen.getAllByRole('button', { name: /^编辑映射 / })).toHaveLength(2);
+    expect(screen.getByText('2 / 4 条映射')).toBeInTheDocument();
 
-    // 客户端模型建议来自 /admin/api/models：datalist 必须包含启用模型。
-    await user.click(screen.getByRole('button', { name: '新建映射' }));
+    await user.selectOptions(screen.getByLabelText('按客户端模型筛选'), 'gpt-4o-mini');
+    await user.selectOptions(screen.getByLabelText('按渠道筛选'), '1');
+    expect(screen.getByText('没有符合筛选条件的映射')).toBeInTheDocument();
+    expect(screen.queryByRole('table')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '清除筛选' }));
+    expect(screen.getByLabelText('按客户端模型筛选')).toHaveValue('all');
+    expect(screen.getByLabelText('按渠道筛选')).toHaveValue('all');
+    expect(await screen.findByRole('region', { name: 'gpt-5-codex 模型路由' })).toBeInTheDocument();
+
+    // 客户端模型建议来自 /admin/api/models：datalist 必须包含已发布模型。
+    await user.click(screen.getByRole('button', { name: '高级手工映射' }));
     const options = Array.from(
       container.querySelectorAll('#mapping-client-model-options option'),
     ).map((option) => option.getAttribute('value'));
     expect(options).toEqual(['gpt-4o-mini', 'gpt-5-codex']);
+  });
+
+  it('聚合保留停用映射与已删除渠道，可用数同时依赖映射和渠道启用', async () => {
+    const routes: ModelRoute[] = [
+      CODEX_ROUTE,
+      { ...CODEX_ROUTE, id: 2, channel_id: 2, enabled: false },
+      { ...CODEX_ROUTE, id: 3, channel_id: 99 },
+      { ...CODEX_ROUTE, id: 4, client_model: 'retired-model', channel_id: 2, enabled: false },
+    ];
+    const backend = createBackend(routes, [{ ...CODEX_CHANNEL, enabled: false }, CHAT_CHANNEL]);
+    const fetchMock = installFetch(backend.handler);
+    const user = userEvent.setup();
+
+    render(<MappingsPage />);
+
+    const group = await screen.findByRole('region', { name: 'gpt-5-codex 模型路由' });
+    expect(within(group).getByText('已配置 3 条')).toBeInTheDocument();
+    expect(within(group).getByText('可用 0 条')).toBeInTheDocument();
+    expect(within(group).getByText('无可用路由')).toBeInTheDocument();
+    expect(within(group).queryByText('全部停用')).not.toBeInTheDocument();
+    expect(within(group).getByText('codex-primary · openai_responses · 渠道已停用')).toBeInTheDocument();
+    expect(within(group).getByText('chat-backup · openai_chat · 映射已停用')).toBeInTheDocument();
+    expect(within(group).getByText('已删除或未知渠道 #99')).toBeInTheDocument();
+    expect(within(group).queryByText(/^可用协议：/)).not.toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: 'retired-model 模型路由' })).getByText('全部停用'))
+      .toBeInTheDocument();
+    expect(screen.getByText(/暂无已发布的客户端模型/)).toBeInTheDocument();
+    expect(backend.deriveModels()).toEqual([]);
+    expect(screen.queryByRole('table')).not.toBeInTheDocument();
+
+    await expandModel(user, 'gpt-5-codex');
+    const disabledChannelRow = rowOf(screen.getByRole('button', {
+      name: '编辑映射 gpt-5-codex → codex-primary',
+    }));
+    expect(within(disabledChannelRow).getByText('启用')).toBeInTheDocument();
+    expect(within(disabledChannelRow).getByText('渠道已停用')).toBeInTheDocument();
+    const deletedChannelRow = rowOf(screen.getByRole('button', {
+      name: '编辑映射 gpt-5-codex → 渠道 #99',
+    }));
+    expect(within(deletedChannelRow).getByText('已删除或未知渠道')).toBeInTheDocument();
+
+    await user.selectOptions(screen.getByLabelText('按渠道筛选'), '1');
+    expect(within(group).getByText('已配置 1 条')).toBeInTheDocument();
+    expect(within(group).getByText('可用 0 条')).toBeInTheDocument();
+    expect(within(group).queryByText('已删除或未知渠道 #99')).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'retired-model 模型路由' })).not.toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: /^编辑映射 / })).toHaveLength(1);
+    expect(callsFor(fetchMock, '/admin/api/model-routes', 'GET')).toHaveLength(1);
+    expect(callsFor(fetchMock, '/admin/api/models', 'GET')).toHaveLength(1);
+  });
+
+  it('展开后启用映射，并通过取消及确认删除保留既有 CRUD 与模型刷新', async () => {
+    const backend = createBackend([{ ...CODEX_ROUTE, enabled: false }], [CODEX_CHANNEL]);
+    const fetchMock = installFetch(backend.handler);
+    const user = userEvent.setup();
+
+    render(<MappingsPage />);
+
+    const group = await expandModel(user, 'gpt-5-codex');
+    expect(within(group).getByText('全部停用')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '启用映射 gpt-5-codex → codex-primary' }));
+    expect(await screen.findByText('映射已启用。')).toBeInTheDocument();
+    expect(within(group).getByText('可用 1 条')).toBeInTheDocument();
+    expect(within(group).queryByText('全部停用')).not.toBeInTheDocument();
+    const patchCalls = callsFor(fetchMock, '/admin/api/model-routes/1', 'PATCH');
+    expect(patchCalls).toHaveLength(1);
+    expect(JSON.parse(String(patchCalls[0]?.[1]?.body))).toEqual({ enabled: true });
+
+    await user.click(screen.getByRole('button', { name: '删除映射 gpt-5-codex → codex-primary' }));
+    expect(hasRequest(fetchMock, '/admin/api/model-routes/1', 'DELETE')).toBe(false);
+    await user.click(screen.getByRole('button', { name: '取消删除映射 gpt-5-codex → codex-primary' }));
+    expect(screen.queryByRole('button', { name: '确认删除映射 gpt-5-codex → codex-primary' })).not.toBeInTheDocument();
+    expect(backend.routes).toHaveLength(1);
+
+    await user.click(screen.getByRole('button', { name: '删除映射 gpt-5-codex → codex-primary' }));
+    await user.click(screen.getByRole('button', { name: '确认删除映射 gpt-5-codex → codex-primary' }));
+    expect(await screen.findByText('映射已删除。')).toBeInTheDocument();
+    expect(callsFor(fetchMock, '/admin/api/model-routes/1', 'DELETE')).toHaveLength(1);
+    expect(screen.getByText('尚无模型映射')).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'gpt-5-codex 模型路由' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('table')).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/暂无已发布的客户端模型/)).toBeInTheDocument());
+    expect(callsFor(fetchMock, '/admin/api/models', 'GET')).toHaveLength(3);
+    expect(backend.routes).toEqual([]);
   });
 
   it('编辑映射时表单预填，保存后行内上游模型与优先级更新', async () => {
@@ -398,6 +538,7 @@ describe('模型映射页', () => {
 
     render(<MappingsPage />);
 
+    await expandModel(user, 'gpt-5-codex');
     const editButton = await screen.findByRole('button', {
       name: '编辑映射 gpt-5-codex → codex-primary',
     });
@@ -468,7 +609,7 @@ describe('模型映射页', () => {
 
     expect(await screen.findByText('登录状态已失效')).toBeInTheDocument();
     expect(redirectSpy).toHaveBeenCalled();
-    expect(screen.queryByRole('button', { name: '新建映射' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '高级手工映射' })).not.toBeInTheDocument();
     expect(screen.queryByRole('table')).not.toBeInTheDocument();
   });
 });

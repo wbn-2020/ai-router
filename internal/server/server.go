@@ -27,8 +27,10 @@ import (
 	"ai-router/internal/adminapi"
 	"ai-router/internal/adminauth"
 	"ai-router/internal/config"
+	"ai-router/internal/requestid"
 	"ai-router/internal/secret"
 	"ai-router/internal/store"
+	"ai-router/internal/upstream"
 	"ai-router/internal/webassets"
 )
 
@@ -66,10 +68,15 @@ type Options struct {
 	Store *store.Store
 	// MasterKeyLoaded 表示启动时主密钥已成功加载。
 	MasterKeyLoaded bool
+	// MasterKey 是已解析的 32 字节主密钥；非空时管理 API 直接使用它，
+	// 不再从进程环境变量重复解析。
+	MasterKey []byte
 	// RequiredSchemaVersion 是二进制期望的最高迁移版本；<= 0 时取内嵌迁移的最高版本。
 	RequiredSchemaVersion int
 	// MaxBodyBytes 为 <= 0 时使用 DefaultMaxBodyBytes。
 	MaxBodyBytes int64
+	// CaptureMaxBytes 是单侧请求/响应 body 捕获上限；<= 0 时使用默认 8 MiB。
+	CaptureMaxBytes int64
 	// ShutdownTimeout 为 <= 0 时使用 DefaultShutdownTimeout。
 	ShutdownTimeout time.Duration
 	// Logger 为 nil 时使用 slog.Default()。
@@ -79,11 +86,15 @@ type Options struct {
 	// Server 会用 Store 的数据库自动创建管理器。
 	AdminAuth *adminauth.Manager
 	// AdminPassword 用于首次创建管理员；已有管理员记录时忽略。为空时回退读取
-	// GATEWAY_ADMIN_PASSWORD，保证 cmd/gateway 无需额外改动即可完成首次初始化。
+	// GATEWAY_ADMIN_PASSWORD，兼容直接构造 Server 的旧入口。
 	AdminPassword string
 	// CookieSecure 控制管理端 session cookie 的 Secure 标志；false 时回退读取
 	// GATEWAY_COOKIE_SECURE（未设置则保持 false）。
-	CookieSecure bool
+	CookieSecure          bool
+	UpstreamClient        *upstream.Client
+	ProbeTimeout          time.Duration
+	ModelDiscoveryTimeout time.Duration
+	Runtime               adminapi.RuntimeReader
 }
 
 // Server 持有 HTTP 处理器、监听配置与退出状态。
@@ -208,8 +219,8 @@ func newAdminAPI(opts Options) (*adminapi.API, error) {
 			return nil, fmt.Errorf("server: 初始化管理员鉴权失败：%w", err)
 		}
 
-		// T06 的允许文件不含 cmd/gateway/main.go；在 main 显式注入 Options 之前，
-		// 回退读取同一环境变量，保证 `gateway serve` 设置密码后即可登录。
+		// T06 的历史入口允许不传 AdminPassword；main 现在显式传入配置值，
+		// 环境变量回退仅用于直接构造 Server 的测试/嵌入场景。
 		password := opts.AdminPassword
 		if password == "" {
 			password = os.Getenv(config.EnvAdminPassword)
@@ -245,11 +256,34 @@ func newAdminAPI(opts Options) (*adminapi.API, error) {
 		}
 	}
 
+	var envelope *secret.Envelope
+	if len(opts.MasterKey) > 0 {
+		if len(opts.MasterKey) != secret.MasterKeySize {
+			return nil, fmt.Errorf("server: 主密钥长度必须为 %d 字节", secret.MasterKeySize)
+		}
+		var err error
+		envelope, err = secret.NewEnvelope(opts.MasterKey)
+		if err != nil {
+			return nil, fmt.Errorf("server: 初始化主密钥信封失败：%w", err)
+		}
+	}
+
+	var models adminapi.ModelLister
+	if opts.UpstreamClient != nil {
+		models = opts.UpstreamClient
+	}
 	api, err := adminapi.New(adminapi.Options{
-		Auth:         manager,
-		DB:           db,
-		CookieSecure: cookieSecure,
-		Logger:       opts.Logger,
+		Auth:                  manager,
+		DB:                    db,
+		Envelope:              envelope,
+		CookieSecure:          cookieSecure,
+		CaptureMaxBytes:       opts.CaptureMaxBytes,
+		Models:                models,
+		ProbeClient:           opts.UpstreamClient,
+		ProbeTimeout:          opts.ProbeTimeout,
+		ModelDiscoveryTimeout: opts.ModelDiscoveryTimeout,
+		Runtime:               opts.Runtime,
+		Logger:                opts.Logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("server: 初始化管理 API 失败：%w", err)
@@ -370,7 +404,7 @@ func (s *Server) withMiddleware(next http.Handler) http.Handler {
 
 		requestID := newRequestID()
 		w.Header().Set(requestIDHeader, requestID)
-		r = r.WithContext(context.WithValue(r.Context(), requestIDContextKey{}, requestID))
+		r = r.WithContext(requestid.With(r.Context(), requestID))
 
 		defer func() {
 			recovered := recover()
@@ -465,12 +499,9 @@ type errorBody struct {
 	RequestID string `json:"request_id,omitempty"`
 }
 
-type requestIDContextKey struct{}
-
 // RequestIDFromContext 返回中间件为请求生成的 ID；不存在时返回空串。
 func RequestIDFromContext(ctx context.Context) string {
-	id, _ := ctx.Value(requestIDContextKey{}).(string)
-	return id
+	return requestid.From(ctx)
 }
 
 func newRequestID() string {

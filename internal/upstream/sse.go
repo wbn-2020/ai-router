@@ -22,6 +22,8 @@ const (
 var (
 	// ErrSSEEventTooLarge 表示单个 SSE 事件超过 MaxEventBytes。
 	ErrSSEEventTooLarge = errors.New("upstream: SSE 事件超过大小上限")
+	// ErrSSETruncatedEvent 表示 EOF 到来前事件没有空行分隔符。
+	ErrSSETruncatedEvent = errors.New("upstream: SSE 事件未完整结束")
 	// ErrSSEIdleTimeout 表示流连续超过 IdleTimeout 没有收到任何字节。
 	ErrSSEIdleTimeout = errors.New("upstream: SSE 流空闲超时")
 )
@@ -105,8 +107,8 @@ func NewSSEReader(r io.Reader, opts SSEReaderOptions) *SSEReader {
 //
 // 注释行也属于事件内容：仅包含注释的块会作为 Comments 非空的事件返回，
 // 使调用方在提交前可以原样缓冲、提交后可以原样转发 keep-alive。
-// 流正常结束时返回 io.EOF；没有空行分隔的最后一个事件也会先返回，再在
-// 下一次调用返回 io.EOF。
+// 流正常结束时返回 io.EOF；没有空行分隔的尾帧返回 ErrSSETruncatedEvent，
+// 不把客户端无法派发的残帧当作完整事件。
 func (r *SSEReader) Next() (SSEEvent, error) {
 	if r == nil || r.reader == nil {
 		return SSEEvent{}, io.EOF
@@ -146,7 +148,7 @@ func (r *SSEReader) Next() (SSEEvent, error) {
 		if err != nil {
 			// 这里只会是 io.EOF：最后一个事件没有以空行结束。
 			if event.hasLines {
-				return event, nil
+				return SSEEvent{}, ErrSSETruncatedEvent
 			}
 			return SSEEvent{}, io.EOF
 		}

@@ -225,7 +225,7 @@ const OVERLAY_STYLE: CSSProperties = {
   alignItems: 'center',
   justifyContent: 'center',
   padding: 20,
-  background: 'rgba(15, 23, 42, 0.52)',
+  background: 'var(--color-overlay-strong)',
 };
 
 const DIALOG_STYLE: CSSProperties = {

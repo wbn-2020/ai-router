@@ -1,6 +1,7 @@
 package adminapi
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"os"
@@ -42,13 +43,14 @@ func (a *API) registerChannelRoutes() {
 // 指针字段用于区分“未提供”与显式零值：priority 省略为 0，
 // max_concurrency 省略为 1，enabled 省略为 true。
 type createChannelRequest struct {
-	Name           string `json:"name"`
-	BaseURL        string `json:"base_url"`
-	Key            string `json:"key"`
-	Protocol       string `json:"protocol"`
-	Priority       *int   `json:"priority"`
-	MaxConcurrency *int   `json:"max_concurrency"`
-	Enabled        *bool  `json:"enabled"`
+	Name           string   `json:"name"`
+	BaseURL        string   `json:"base_url"`
+	Key            string   `json:"key"`
+	Protocol       string   `json:"protocol"`
+	Models         []string `json:"models"`
+	Priority       *int     `json:"priority"`
+	MaxConcurrency *int     `json:"max_concurrency"`
+	Enabled        *bool    `json:"enabled"`
 }
 
 // updateChannelRequest 是更新渠道的请求体；省略字段保持原值。
@@ -64,44 +66,82 @@ type updateChannelRequest struct {
 
 // channelView 是管理端可见的渠道视图：不包含 key 或 key_ciphertext。
 type channelView struct {
-	ID                  int64      `json:"id"`
-	Name                string     `json:"name"`
-	BaseURL             string     `json:"base_url"`
-	Protocol            string     `json:"protocol"`
-	KeyMask             string     `json:"key_mask"`
-	Priority            int        `json:"priority"`
-	MaxConcurrency      int        `json:"max_concurrency"`
-	Enabled             bool       `json:"enabled"`
-	LastUsedAt          *time.Time `json:"last_used_at,omitempty"`
-	LastHealthStatus    string     `json:"last_health_status,omitempty"`
-	LastHealthLatencyMS *int       `json:"last_health_latency_ms,omitempty"`
-	LastHealthAt        *time.Time `json:"last_health_at,omitempty"`
-	LastError           string     `json:"last_error,omitempty"`
-	CreatedAt           time.Time  `json:"created_at"`
-	UpdatedAt           time.Time  `json:"updated_at"`
+	ID                   int64              `json:"id"`
+	Name                 string             `json:"name"`
+	BaseURL              string             `json:"base_url"`
+	Protocol             string             `json:"protocol"`
+	KeyMask              string             `json:"key_mask"`
+	ModelCount           int                `json:"model_count"`
+	Priority             int                `json:"priority"`
+	MaxConcurrency       int                `json:"max_concurrency"`
+	Enabled              bool               `json:"enabled"`
+	ConnectionRevision   int64              `json:"connection_revision"`
+	LastHealthRevision   int64              `json:"last_health_revision"`
+	LastHealthModel      string             `json:"last_health_model"`
+	LastHealthProtocol   string             `json:"last_health_protocol"`
+	LastHealthKind       string             `json:"last_health_kind"`
+	LastHealthDurationMS *int               `json:"last_health_duration_ms"`
+	Runtime              channelRuntimeView `json:"runtime"`
+	LastUsedAt           *time.Time         `json:"last_used_at,omitempty"`
+	LastHealthStatus     string             `json:"last_health_status,omitempty"`
+	LastHealthLatencyMS  *int               `json:"last_health_latency_ms,omitempty"`
+	LastHealthAt         *time.Time         `json:"last_health_at,omitempty"`
+	LastError            string             `json:"last_error,omitempty"`
+	CreatedAt            time.Time          `json:"created_at"`
+	UpdatedAt            time.Time          `json:"updated_at"`
 }
 
 type channelListResponse struct {
 	Channels []channelView `json:"channels"`
 }
 
-func newChannelView(channel store.Channel) channelView {
+type channelRuntimeView struct {
+	State           string     `json:"state"`
+	InUse           int        `json:"in_use"`
+	Limit           int        `json:"limit"`
+	OpenUntil       *time.Time `json:"open_until"`
+	LastError       string     `json:"last_error"`
+	ModelCooldowns  int        `json:"model_cooldowns"`
+	ModelRecovering int        `json:"model_recovering"`
+}
+
+func (a *API) newChannelView(channel store.Channel, modelCount int) channelView {
+	runtime := channelRuntimeView{State: "unknown"}
+	if a.runtime != nil {
+		snapshot := a.runtime.Runtime(channel)
+		runtime = channelRuntimeView{
+			State: snapshot.State, InUse: snapshot.InUse, Limit: snapshot.Limit,
+			OpenUntil: utcTime(snapshot.OpenUntil), LastError: secret.RedactValue(snapshot.LastError),
+			ModelCooldowns: snapshot.ModelCooldowns, ModelRecovering: snapshot.ModelRecovering,
+		}
+		if runtime.State == "" {
+			runtime.State = "unknown"
+		}
+	}
 	return channelView{
-		ID:                  channel.ID,
-		Name:                channel.Name,
-		BaseURL:             channel.BaseURL,
-		Protocol:            channel.Protocol,
-		KeyMask:             channel.KeyMask,
-		Priority:            channel.Priority,
-		MaxConcurrency:      channel.MaxConcurrency,
-		Enabled:             channel.Enabled,
-		LastUsedAt:          utcTime(channel.LastUsedAt),
-		LastHealthStatus:    channel.LastHealthStatus,
-		LastHealthLatencyMS: channel.LastHealthLatencyMS,
-		LastHealthAt:        utcTime(channel.LastHealthAt),
-		LastError:           channel.LastError,
-		CreatedAt:           channel.CreatedAt.UTC(),
-		UpdatedAt:           channel.UpdatedAt.UTC(),
+		ID:                   channel.ID,
+		Name:                 channel.Name,
+		BaseURL:              channel.BaseURL,
+		Protocol:             channel.Protocol,
+		KeyMask:              channel.KeyMask,
+		ModelCount:           modelCount,
+		Priority:             channel.Priority,
+		MaxConcurrency:       channel.MaxConcurrency,
+		Enabled:              channel.Enabled,
+		ConnectionRevision:   channel.ConnectionRevision,
+		LastHealthRevision:   channel.LastHealthRevision,
+		LastHealthModel:      channel.LastHealthModel,
+		LastHealthProtocol:   channel.LastHealthProtocol,
+		LastHealthKind:       channel.LastHealthKind,
+		LastHealthDurationMS: channel.LastHealthDurationMS,
+		Runtime:              runtime,
+		LastUsedAt:           utcTime(channel.LastUsedAt),
+		LastHealthStatus:     channel.LastHealthStatus,
+		LastHealthLatencyMS:  channel.LastHealthLatencyMS,
+		LastHealthAt:         utcTime(channel.LastHealthAt),
+		LastError:            channel.LastError,
+		CreatedAt:            channel.CreatedAt.UTC(),
+		UpdatedAt:            channel.UpdatedAt.UTC(),
 	}
 }
 
@@ -111,6 +151,49 @@ func utcTime(value *time.Time) *time.Time {
 	}
 	utc := value.UTC()
 	return &utc
+}
+
+// channelModelCounts 一次查询返回所有渠道的模型数；失败时只返回空 map，
+// 渠道列表仍可用，不因统计失败整体报错。
+func (a *API) channelModelCounts(ctx context.Context) map[int64]int {
+	counts := make(map[int64]int)
+	if a.db == nil {
+		return counts
+	}
+	rows, err := a.db.QueryContext(ctx,
+		`SELECT channel_id, COUNT(*) FROM model_routes GROUP BY channel_id`)
+	if err != nil {
+		a.logger.Error("统计渠道模型数失败", "error", secret.RedactValue(err.Error()))
+		return counts
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var channelID int64
+		var count int
+		if err := rows.Scan(&channelID, &count); err != nil {
+			a.logger.Error("解析渠道模型数失败", "error", secret.RedactValue(err.Error()))
+			return counts
+		}
+		counts[channelID] = count
+	}
+	if err := rows.Err(); err != nil {
+		a.logger.Error("遍历渠道模型数失败", "error", secret.RedactValue(err.Error()))
+	}
+	return counts
+}
+
+func (a *API) channelModelCount(ctx context.Context, channelID int64) int {
+	if a.db == nil {
+		return 0
+	}
+	var count int
+	if err := a.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM model_routes WHERE channel_id = ?`, channelID).Scan(&count); err != nil {
+		a.logger.Error("读取渠道模型数失败", "channel_id", channelID,
+			"error", secret.RedactValue(err.Error()))
+		return 0
+	}
+	return count
 }
 
 func (a *API) handleListChannels(w http.ResponseWriter, r *http.Request) {
@@ -124,8 +207,9 @@ func (a *API) handleListChannels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	views := make([]channelView, 0, len(channels))
+	counts := a.channelModelCounts(r.Context())
 	for _, channel := range channels {
-		views = append(views, newChannelView(channel))
+		views = append(views, a.newChannelView(channel, counts[channel.ID]))
 	}
 	writeJSON(w, http.StatusOK, channelListResponse{Channels: views})
 }
@@ -144,7 +228,7 @@ func (a *API) handleGetChannel(w http.ResponseWriter, r *http.Request) {
 		a.writeChannelError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, newChannelView(channel))
+	writeJSON(w, http.StatusOK, a.newChannelView(channel, a.channelModelCount(r.Context(), channel.ID)))
 }
 
 func (a *API) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
@@ -181,7 +265,7 @@ func (a *API) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 		enabled = *req.Enabled
 	}
 
-	channel, err := repo.Create(r.Context(), store.ChannelInput{
+	input := store.ChannelInput{
 		ChannelConfig: store.ChannelConfig{
 			Name:           req.Name,
 			BaseURL:        req.BaseURL,
@@ -192,12 +276,21 @@ func (a *API) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 		},
 		KeyCiphertext: ciphertext,
 		KeyMask:       mask,
-	})
+	}
+	modelCount := 0
+	var channel store.Channel
+	if len(req.Models) > 0 {
+		var routes []store.ModelRoute
+		channel, routes, err = repo.CreateWithModels(r.Context(), input, req.Models)
+		modelCount = len(routes)
+	} else {
+		channel, err = repo.Create(r.Context(), input)
+	}
 	if err != nil {
 		a.writeChannelError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, newChannelView(channel))
+	writeJSON(w, http.StatusCreated, a.newChannelView(channel, modelCount))
 }
 
 func (a *API) handleUpdateChannel(w http.ResponseWriter, r *http.Request) {
@@ -270,7 +363,7 @@ func (a *API) handleUpdateChannel(w http.ResponseWriter, r *http.Request) {
 		a.writeChannelError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, newChannelView(channel))
+	writeJSON(w, http.StatusOK, a.newChannelView(channel, a.channelModelCount(r.Context(), channel.ID)))
 }
 
 func (a *API) handleDeleteChannel(w http.ResponseWriter, r *http.Request) {
@@ -289,12 +382,11 @@ func (a *API) handleDeleteChannel(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// channelDependencies 从管理 API 已持有的数据库连接构造渠道仓储，并解析
-// GATEWAY_MASTER_KEY。
+// channelDependencies 从管理 API 已持有的数据库连接构造渠道仓储。
 //
-// 主密钥由内部 config 层在启动时校验；这里复用同一环境变量，避免在
-// adminapi.Options 中额外传递秘密值。未配置主密钥时渠道端点返回 503，
-// /readyz 同时会报告 master_key_not_loaded。
+// 生产路径由 server.Options.MasterKey 构造信封并显式注入；未注入时回退读取
+// GATEWAY_MASTER_KEY，兼容直接构造 adminapi 的测试/嵌入场景。未配置主密钥时
+// 渠道端点返回 503，/readyz 同时会报告 master_key_not_loaded。
 func (a *API) channelDependencies(w http.ResponseWriter) (*store.Channels, *secret.Envelope, bool) {
 	if a.db == nil {
 		writeError(w, http.StatusServiceUnavailable, "channels_unavailable",
@@ -307,12 +399,16 @@ func (a *API) channelDependencies(w http.ResponseWriter) (*store.Channels, *secr
 			"渠道管理暂不可用：数据库或主密钥未就绪")
 		return nil, nil, false
 	}
-	envelope, err := channelMasterEnvelope()
-	if err != nil {
-		a.logger.Error("渠道管理需要主密钥，但 GATEWAY_MASTER_KEY 不可用")
-		writeError(w, http.StatusServiceUnavailable, "channels_unavailable",
-			"渠道管理暂不可用：数据库或主密钥未就绪")
-		return nil, nil, false
+	envelope := a.envelope
+	if envelope == nil {
+		var err error
+		envelope, err = channelMasterEnvelope()
+		if err != nil {
+			a.logger.Error("渠道管理需要主密钥，但 GATEWAY_MASTER_KEY 不可用")
+			writeError(w, http.StatusServiceUnavailable, "channels_unavailable",
+				"渠道管理暂不可用：数据库或主密钥未就绪")
+			return nil, nil, false
+		}
 	}
 	return store.NewChannels(db), envelope, true
 }
@@ -357,6 +453,8 @@ func (a *API) writeChannelError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "invalid_channel_config", validation.Reason)
 	case errors.Is(err, store.ErrInvalidChannel):
 		writeError(w, http.StatusBadRequest, "invalid_channel_config", "渠道配置无效")
+	case errors.Is(err, store.ErrInvalidModelRoute):
+		writeError(w, http.StatusBadRequest, "invalid_models", "模型列表无效，请检查模型名")
 	case errors.Is(err, store.ErrChannelNameConflict):
 		writeError(w, http.StatusConflict, "channel_name_conflict", "渠道名称已存在")
 	case errors.Is(err, store.ErrChannelNotFound):

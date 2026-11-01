@@ -14,11 +14,15 @@ import (
 )
 
 const (
-	// maxUpstreamAttempts 是单次请求最多尝试的不同渠道数。
+	// maxUpstreamAttempts 是单次请求最多尝试的不同渠道数的默认上限。
 	//
 	// 失败切换只按渠道计数：同一渠道失败后加入排除集合，不会再次尝试；
 	// 达到上限后无论是否还有候选都返回最后一次归一化错误。
 	maxUpstreamAttempts = 3
+
+	// maxNonStreamResponseBytes 是非流式成功响应允许读入内存的上限。
+	// 超限按不可重试的上游错误返回，避免单个响应耗尽进程内存。
+	maxNonStreamResponseBytes int64 = 32 << 20
 
 	// 上游错误归一化后的稳定 code。客户端只看到这些固定值，不看到上游
 	// 响应 body、状态说明或 URL。
@@ -46,13 +50,33 @@ const (
 // Message 必须是固定文案，不得包含上游 body、Key、base_url 或查询串；
 // Retry 只决定是否切换下一个渠道，不影响已经返回的 HTTP 状态。
 type proxyFailure struct {
-	Status     int
-	Code       string
-	Type       string
-	Message    string
-	Retry      bool
-	RetryAfter string
-	Canceled   bool
+	Status      int
+	Code        string
+	Type        string
+	Message     string
+	Retry       bool
+	RetryAfter  string
+	Canceled    bool
+	Scope       string
+	FaultStatus int
+	Cooldown    time.Duration
+}
+
+func (f proxyFailure) routingFailure(status int) routing.Failure {
+	scope := f.Scope
+	if scope == "" {
+		scope = routing.FailureScopeChannel
+		if status == http.StatusNotFound {
+			scope = routing.FailureScopeModel
+		}
+		if status >= 400 && status < 500 && status != 401 && status != 403 && status != 404 && status != 408 && status != 429 {
+			scope = routing.FailureScopeRequest
+		}
+	}
+	if f.FaultStatus != 0 {
+		status = f.FaultStatus
+	}
+	return routing.Failure{Scope: scope, Status: status, Message: f.Message, RetryAfter: f.Cooldown}
 }
 
 func (f proxyFailure) apiError() APIError {
@@ -245,9 +269,9 @@ func classifyUpstreamError(err error) proxyFailure {
 
 // schedulingFailure 把调度器的稳定错误映射为客户端错误。
 //
-// 无候选（含协议不匹配、映射/渠道禁用、熔断过滤）返回 404
-// model_not_available；全部候选满载返回 429 + Retry-After: 1；其他
-// 仓储/内部错误只返回固定的 500，不泄露 SQL。
+// 无候选（协议不匹配/映射或渠道禁用）返回 404 model_not_available；全部
+// 候选熔断返回 503 + Retry-After；全部候选满载返回 429 + Retry-After: 1；
+// 其他仓储/内部错误只返回固定的 500，不泄露 SQL。
 func schedulingFailure(err error) proxyFailure {
 	switch {
 	case errors.Is(err, routing.ErrNoCandidates):
@@ -256,6 +280,14 @@ func schedulingFailure(err error) proxyFailure {
 			Code:    errorCodeModelNotAvailable,
 			Type:    errorTypeInvalidRequest,
 			Message: "The requested model does not exist or is not available.",
+		}
+	case errors.Is(err, routing.ErrAllCircuitsOpen):
+		return proxyFailure{
+			Status:     http.StatusServiceUnavailable,
+			Code:       errorCodeUpstreamUnavailable,
+			Type:       errorTypeServer,
+			Message:    "All candidate channels are temporarily unavailable.",
+			RetryAfter: "1",
 		}
 	case errors.Is(err, routing.ErrChannelCapacity):
 		return proxyFailure{
@@ -373,6 +405,18 @@ func retryCount(attempts int) int {
 		return 0
 	}
 	return attempts - 1
+}
+
+// normalizeMaxAttempts 把未配置/非法值收敛到默认上限，并拒绝超过
+// maxUpstreamAttempts 的配置，避免单请求无限放大上游调用。
+func normalizeMaxAttempts(attempts int) int {
+	if attempts <= 0 {
+		return maxUpstreamAttempts
+	}
+	if attempts > maxUpstreamAttempts {
+		return maxUpstreamAttempts
+	}
+	return attempts
 }
 
 func durationMillis(start, end time.Time) int64 {

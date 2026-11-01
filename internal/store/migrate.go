@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"embed"
 	"encoding/hex"
 	"fmt"
@@ -122,51 +123,15 @@ func (s *Store) MigrateWith(ctx context.Context, migrations []Migration) (Migrat
 		return MigrateResult{}, err
 	}
 
-	byVersion := make(map[int]Migration, len(sorted))
-	for _, migration := range sorted {
-		byVersion[migration.Version] = migration
+	fromVersion, err := validateMigrationHistory(applied, sorted)
+	if err != nil {
+		return MigrateResult{}, err
 	}
-
-	fromVersion := 0
-	appliedVersions := make(map[int]struct{}, len(applied))
-	for _, record := range applied {
-		migration, ok := byVersion[record.Version]
-		if !ok {
-			return MigrateResult{}, fmt.Errorf(
-				"store: 数据库已应用迁移 v%d（%s），但当前程序不包含该版本；拒绝降级启动",
-				record.Version, record.Name,
-			)
-		}
-		if record.Name != migration.Name {
-			return MigrateResult{}, fmt.Errorf(
-				"store: 迁移 v%d 记录名 %q 与程序内 %q 不一致；拒绝启动",
-				record.Version, record.Name, migration.Name,
-			)
-		}
-		if actual := migrationChecksum(migration.SQL); record.Checksum != actual {
-			return MigrateResult{}, fmt.Errorf(
-				"store: 迁移 v%d（%s）checksum 不匹配（数据库 %s，程序 %s）；拒绝启动",
-				record.Version, record.Name, record.Checksum, actual,
-			)
-		}
-		appliedVersions[record.Version] = struct{}{}
-		if record.Version > fromVersion {
-			fromVersion = record.Version
-		}
-	}
-
 	var pending []Migration
 	for _, migration := range sorted {
-		if _, ok := appliedVersions[migration.Version]; ok {
-			continue
+		if migration.Version > fromVersion {
+			pending = append(pending, migration)
 		}
-		if migration.Version < fromVersion {
-			return MigrateResult{}, fmt.Errorf(
-				"store: 数据库 schema 已到 v%d，但缺少更早的迁移 v%d（%s）；拒绝乱序迁移",
-				fromVersion, migration.Version, migration.Name,
-			)
-		}
-		pending = append(pending, migration)
 	}
 
 	result := MigrateResult{FromVersion: fromVersion, ToVersion: fromVersion}
@@ -226,8 +191,12 @@ func Migrate(ctx context.Context, paths Paths) (MigrateResult, error) {
 }
 
 func (s *Store) readAppliedMigrations(ctx context.Context) ([]appliedMigration, bool, error) {
+	return readAppliedMigrations(ctx, s.db)
+}
+
+func readAppliedMigrations(ctx context.Context, db *sql.DB) ([]appliedMigration, bool, error) {
 	var tableCount int
-	err := s.db.QueryRowContext(ctx,
+	err := db.QueryRowContext(ctx,
 		`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'`,
 	).Scan(&tableCount)
 	if err != nil {
@@ -237,7 +206,7 @@ func (s *Store) readAppliedMigrations(ctx context.Context) ([]appliedMigration, 
 		return nil, false, nil
 	}
 
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := db.QueryContext(ctx,
 		`SELECT version, name, checksum, applied_at FROM schema_migrations ORDER BY version ASC`,
 	)
 	if err != nil {
@@ -257,6 +226,41 @@ func (s *Store) readAppliedMigrations(ctx context.Context) ([]appliedMigration, 
 		return nil, true, fmt.Errorf("store: 遍历 schema_migrations 失败：%w", err)
 	}
 	return records, true, nil
+}
+
+// validateMigrationHistory 只读验证已应用记录必须是当前迁移集合的完整前缀。
+func validateMigrationHistory(applied []appliedMigration, migrations []Migration) (int, error) {
+	byVersion := make(map[int]Migration, len(migrations))
+	for _, migration := range migrations {
+		byVersion[migration.Version] = migration
+	}
+	version := 0
+	seen := make(map[int]bool, len(applied))
+	for _, record := range applied {
+		migration, ok := byVersion[record.Version]
+		if !ok {
+			return 0, fmt.Errorf("store: 数据库已应用迁移 v%d，但当前程序不包含该版本；拒绝降级启动", record.Version)
+		}
+		if seen[record.Version] {
+			return 0, fmt.Errorf("store: 迁移 v%d 记录重复", record.Version)
+		}
+		if record.Name != migration.Name {
+			return 0, fmt.Errorf("store: 迁移 v%d 记录名与程序不一致", record.Version)
+		}
+		if record.Checksum != migrationChecksum(migration.SQL) {
+			return 0, fmt.Errorf("store: 迁移 v%d checksum 不匹配", record.Version)
+		}
+		seen[record.Version] = true
+		if record.Version > version {
+			version = record.Version
+		}
+	}
+	for _, migration := range migrations {
+		if migration.Version <= version && !seen[migration.Version] {
+			return 0, fmt.Errorf("store: 数据库 schema 已到 v%d，但缺少更早的迁移 v%d；拒绝乱序迁移", version, migration.Version)
+		}
+	}
+	return version, nil
 }
 
 func (s *Store) applyMigration(ctx context.Context, migration Migration) error {

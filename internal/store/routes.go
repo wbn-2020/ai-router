@@ -118,7 +118,22 @@ func (r *ModelRoutes) Create(ctx context.Context, in ModelRouteInput) (ModelRout
 	}
 
 	now := formatChannelTime(time.Now())
-	row := r.db.QueryRowContext(ctx, `
+	return insertModelRoute(ctx, r.db, input, now)
+}
+
+// modelRouteExecer 是 *sql.DB 与 *sql.Tx 共有的最小查询能力。
+type modelRouteExecer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// insertModelRoute 在给定执行器上插入一条已归一化的映射。
+func insertModelRoute(
+	ctx context.Context,
+	exec modelRouteExecer,
+	input ModelRouteInput,
+	now string,
+) (ModelRoute, error) {
+	row := exec.QueryRowContext(ctx, `
 		INSERT INTO model_routes (
 			client_model, channel_id, upstream_model, priority, enabled,
 			created_at, updated_at
@@ -215,13 +230,40 @@ func (r *ModelRoutes) ListByModelAndProtocol(
 // 这里只按映射自身的 enabled 过滤：模型是否可服务还取决于渠道启用状态与
 // 入站协议，由 ListByModelAndProtocol 在候选查询中处理。
 func (r *ModelRoutes) ListModels(ctx context.Context) ([]string, error) {
+	return r.listModels(ctx, "")
+}
+
+// ListModelsByProtocol 返回在指定入站协议下至少有一条可服务映射的客户端
+// 模型：映射启用、渠道启用且渠道协议匹配。用于 Codex manifest 等按协议
+// 暴露模型清单的端点。
+func (r *ModelRoutes) ListModelsByProtocol(ctx context.Context, protocol string) ([]string, error) {
+	if strings.TrimSpace(protocol) == "" {
+		return []string{}, nil
+	}
+	return r.listModels(ctx, protocol)
+}
+
+func (r *ModelRoutes) listModels(ctx context.Context, protocol string) ([]string, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("store: 模型映射仓储未初始化")
 	}
-	rows, err := r.db.QueryContext(ctx, `
+
+	query := `
 		SELECT DISTINCT client_model FROM model_routes
 		WHERE enabled = 1
-		ORDER BY client_model ASC`)
+		ORDER BY client_model ASC`
+	args := []any(nil)
+	if protocol != "" {
+		query = `
+		SELECT DISTINCT mr.client_model
+		FROM model_routes mr
+		JOIN channels c ON c.id = mr.channel_id
+		WHERE mr.enabled = 1 AND c.enabled = 1 AND c.protocol = ?
+		ORDER BY mr.client_model ASC`
+		args = append(args, protocol)
+	}
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("store: 列出客户端模型失败：%w", err)
 	}

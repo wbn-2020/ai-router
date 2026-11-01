@@ -27,8 +27,10 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"ai-router/internal/observability"
+	"ai-router/internal/requestid"
 	"ai-router/internal/upstream"
 )
 
@@ -48,6 +50,26 @@ type requestUsage struct {
 
 	mu     sync.Mutex
 	result observability.UsageResult
+	logged bool
+}
+
+// markLogged 记录代理是否已经为该请求写入最终 request_log。
+func (u *requestUsage) markLogged() {
+	if u == nil {
+		return
+	}
+	u.mu.Lock()
+	u.logged = true
+	u.mu.Unlock()
+}
+
+func (u *requestUsage) wasLogged() bool {
+	if u == nil {
+		return false
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.logged
 }
 
 func (u *requestUsage) reset() {
@@ -141,6 +163,7 @@ type ObservedGateway struct {
 	registry  *usageRegistry
 	requestID func(*http.Request) string
 	capture   *observability.CaptureRing
+	journal   AttemptJournal
 }
 
 var _ http.Handler = (*ObservedGateway)(nil)
@@ -211,6 +234,7 @@ func ObserveGateway(
 		registry:  registry,
 		requestID: outerRequestID,
 		capture:   observability.DefaultCaptureRing(),
+		journal:   journal,
 	}, nil
 }
 
@@ -225,8 +249,10 @@ func (g *ObservedGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	requestID := ""
-	if g.requestID != nil {
+	// 优先复用 server 中间件生成的请求 ID；直接调用 ObservedGateway 时
+	// 回退到注入的生成器或内部随机 ID。
+	requestID := strings.TrimSpace(requestid.From(r.Context()))
+	if !validRequestID(requestID) && g.requestID != nil {
 		requestID = strings.TrimSpace(g.requestID(r))
 	}
 	if !validRequestID(requestID) || g.registry.exists(requestID) {
@@ -237,6 +263,9 @@ func (g *ObservedGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.registry.add(usage)
 	defer g.registry.remove(requestID)
 
+	startedAt := time.Now()
+	recorder := &captureResponseWriter{ResponseWriter: w}
+
 	// 诊断环只保存请求/响应字节，不保存 header；默认情况下不写 SQLite。
 	// 请求体在路由/代理读取时 tee，响应体在写出时 tee；流式 SSE 按写出
 	// 顺序原样保存。session 在 handler 返回后提交，因此 request_logs 中的
@@ -245,15 +274,85 @@ func (g *ObservedGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if r.Body != nil {
 			r.Body = session.TeeRequest(r.Body)
 		}
-		w = &captureResponseWriter{
-			ResponseWriter: w,
-			buffer:         session.ResponseBuffer(),
-		}
+		recorder.buffer = session.ResponseBuffer()
 		defer session.Commit()
 	}
 
 	ctx := context.WithValue(r.Context(), requestUsageContextKey{}, usage)
-	g.inner.ServeHTTP(w, r.WithContext(ctx))
+	g.inner.ServeHTTP(recorder, r.WithContext(ctx))
+
+	// 路由层拒绝（鉴权、方法、模型不可用、forwarder 未接）不会进入
+	// Proxy/StreamProxy，因此不会写 request_logs。这里补一条最小失败日志，
+	// 保证每次失败都有 request_id 可追踪；成功响应仍只由代理层记录。
+	g.logRejectedRequest(r, usage, recorder.statusCode(), startedAt)
+}
+
+// logRejectedRequest 为未进入代理层的 4xx/5xx 响应补写请求日志。
+func (g *ObservedGateway) logRejectedRequest(
+	r *http.Request,
+	usage *requestUsage,
+	status int,
+	startedAt time.Time,
+) {
+	if g == nil || g.journal == nil || usage == nil || usage.wasLogged() || status < 400 {
+		return
+	}
+	path := ""
+	if r != nil && r.URL != nil {
+		path = r.URL.Path
+	}
+	protocol, endpoint := preflightRoute(path)
+	httpStatus := status
+	log := observability.RequestLog{
+		RequestID:  usage.requestID,
+		Protocol:   protocol,
+		Endpoint:   endpoint,
+		Status:     observability.StatusError,
+		HTTPStatus: &httpStatus,
+		ErrorCode:  preflightErrorCode(status, path),
+		StartedAt:  startedAt,
+	}
+	if status >= 500 {
+		log.ErrorMessage = "Internal server error."
+	} else {
+		log.ErrorMessage = "Request rejected before upstream."
+	}
+	// 客户端可能已断开，但日志仍应落库。
+	_ = g.journal.WriteRequest(context.WithoutCancel(r.Context()), log)
+}
+
+func preflightRoute(path string) (protocol, endpoint string) {
+	switch path {
+	case PathResponses, PathCodexResponses:
+		return ProtocolOpenAIResponses, path
+	case PathChatCompletions:
+		return ProtocolOpenAIChat, path
+	default:
+		return "", path
+	}
+}
+
+func preflightErrorCode(status int, path string) string {
+	switch status {
+	case http.StatusUnauthorized:
+		return errorCodeInvalidAPIKey
+	case http.StatusNotFound:
+		if path == PathModels || path == PathCodexModels ||
+			strings.HasPrefix(path, ModelPathPrefix) {
+			return errorCodeModelNotAvailable
+		}
+		return errorCodeNotFound
+	case http.StatusMethodNotAllowed:
+		return errorCodeMethodNotAllowed
+	case http.StatusRequestEntityTooLarge:
+		return errorCodeBodyTooLarge
+	case http.StatusServiceUnavailable:
+		return errorCodeUnavailable
+	case http.StatusInternalServerError:
+		return errorCodeInternal
+	default:
+		return errorCodeInvalidRequest
+	}
 }
 
 // captureResponseWriter 把实际写出的响应字节 tee 到诊断环。
@@ -263,9 +362,20 @@ func (g *ObservedGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 type captureResponseWriter struct {
 	http.ResponseWriter
 	buffer *observability.CaptureBuffer
+	status int
+}
+
+func (w *captureResponseWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+	w.ResponseWriter.WriteHeader(status)
 }
 
 func (w *captureResponseWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
 	n, err := w.ResponseWriter.Write(p)
 	if n > 0 && w.buffer != nil {
 		_, _ = w.buffer.Write(p[:n])
@@ -273,10 +383,19 @@ func (w *captureResponseWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func (w *captureResponseWriter) Flush() {
-	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
-		flusher.Flush()
+func (w *captureResponseWriter) statusCode() int {
+	if w.status == 0 {
+		return http.StatusOK
 	}
+	return w.status
+}
+
+func (w *captureResponseWriter) Flush() {
+	_ = w.FlushError()
+}
+
+func (w *captureResponseWriter) FlushError() error {
+	return http.NewResponseController(w.ResponseWriter).Flush()
 }
 
 func (w *captureResponseWriter) Unwrap() http.ResponseWriter {
@@ -370,6 +489,7 @@ func (j *usageCapturingJournal) WriteAttempt(ctx context.Context, attempt observ
 
 func (j *usageCapturingJournal) WriteRequest(ctx context.Context, log observability.RequestLog) error {
 	if usage := j.registry.get(log.RequestID); usage != nil {
+		usage.markLogged()
 		result := usage.snapshot()
 		if result.Found() {
 			if log.InputTokens == nil {

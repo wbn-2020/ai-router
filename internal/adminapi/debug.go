@@ -18,7 +18,7 @@ import (
 	"ai-router/internal/upstream"
 )
 
-// T22 调试 API：渠道连通性测试与模型路由测试。
+// T22 调试 API：指定模型的有效生成检查与模型映射测试。
 //
 // 约束：
 //   - 探针使用渠道协议的原生最小请求（ping，输出上限 16 tokens），会消耗
@@ -47,14 +47,6 @@ var (
 	errDebugChannelNoMapping = errors.New("adminapi: 渠道没有启用的模型映射")
 )
 
-// newDebugProbeClient 构造调试探针使用的上游 HTTP client。
-//
-// 计划要求 adminapi 只依赖 upstream probe；管理 API 不持有运行时配置，因此
-// 使用 upstream 默认超时。测试可替换该函数注入更短的超时来覆盖超时路径。
-var newDebugProbeClient = func() (*upstream.Client, error) {
-	return upstream.NewClient(upstream.DefaultOptions())
-}
-
 func (a *API) registerDebugRoutes() {
 	a.mux.Handle("POST /admin/api/debug/channels/{id}/test",
 		a.requireSession(http.HandlerFunc(a.handleDebugChannelTest)))
@@ -71,10 +63,15 @@ type debugChannelTestRequest struct {
 //
 // Error 已经过脱敏；RequestLink 指向按渠道/模型筛选的请求观测页。
 type debugTestResponse struct {
-	Status     string `json:"status"`
-	HTTPStatus int    `json:"http_status"`
-	LatencyMS  int    `json:"latency_ms"`
-	Error      string `json:"error,omitempty"`
+	Status             string `json:"status"`
+	HTTPStatus         int    `json:"http_status"`
+	LatencyMS          int    `json:"latency_ms"`
+	DurationMS         int    `json:"duration_ms"`
+	ErrorCode          string `json:"error_code"`
+	Protocol           string `json:"protocol"`
+	ConnectionRevision int64  `json:"connection_revision"`
+	Kind               string `json:"kind"`
+	Error              string `json:"error,omitempty"`
 
 	ChannelID   int64  `json:"channel_id"`
 	ChannelName string `json:"channel_name"`
@@ -321,20 +318,19 @@ func (a *API) runDebugProbe(
 	if err != nil {
 		return upstream.ProbeResult{}, fmt.Errorf("解密渠道上游 Key 失败：%w", err)
 	}
-	client, err := newDebugProbeClient()
-	if err != nil {
-		return upstream.ProbeResult{}, fmt.Errorf("构造上游探针 client 失败：%w", err)
-	}
-	prober, err := upstream.NewProber(client, recorder)
+	prober, err := upstream.NewProber(a.probeClient, recorder)
 	if err != nil {
 		return upstream.ProbeResult{}, fmt.Errorf("构造上游探针失败：%w", err)
 	}
+	ctx, cancel := context.WithTimeout(ctx, a.probeTimeout)
+	defer cancel()
 	return prober.Probe(ctx, upstream.Target{
-		ChannelID:   channel.ID,
-		ChannelName: channel.Name,
-		BaseURL:     channel.BaseURL,
-		Protocol:    channel.Protocol,
-		APIKey:      key,
+		ConnectionRevision: channel.ConnectionRevision,
+		ChannelID:          channel.ID,
+		ChannelName:        channel.Name,
+		BaseURL:            channel.BaseURL,
+		Protocol:           channel.Protocol,
+		APIKey:             key,
 	}, upstreamModel)
 }
 
@@ -344,16 +340,21 @@ func newDebugTestResponse(
 	result upstream.ProbeResult,
 ) debugTestResponse {
 	return debugTestResponse{
-		Status:        result.Status,
-		HTTPStatus:    result.HTTPStatus,
-		LatencyMS:     result.LatencyMS,
-		Error:         secret.RedactValue(result.Error),
-		ChannelID:     channel.ID,
-		ChannelName:   channel.Name,
-		Model:         clientModel,
-		UpstreamModel: upstreamModel,
-		TestedAt:      time.Now().UTC(),
-		RequestLink:   debugRequestLink(channel.ID, clientModel),
+		Status:             result.Status,
+		HTTPStatus:         result.HTTPStatus,
+		LatencyMS:          result.LatencyMS,
+		DurationMS:         result.DurationMS,
+		ErrorCode:          result.ErrorCode,
+		Protocol:           channel.Protocol,
+		ConnectionRevision: channel.ConnectionRevision,
+		Kind:               "generation",
+		Error:              secret.RedactValue(result.Error),
+		ChannelID:          channel.ID,
+		ChannelName:        channel.Name,
+		Model:              clientModel,
+		UpstreamModel:      upstreamModel,
+		TestedAt:           time.Now().UTC(),
+		RequestLink:        debugRequestLink(channel.ID, clientModel),
 	}
 }
 

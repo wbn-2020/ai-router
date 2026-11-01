@@ -64,11 +64,12 @@ func newCaptureServer(t *testing.T, status int, responseBody string) (*httptest.
 
 func testTarget(server *httptest.Server, protocol string) Target {
 	return Target{
-		ChannelID:   42,
-		ChannelName: "test-channel",
-		BaseURL:     server.URL + "/v1",
-		Protocol:    protocol,
-		APIKey:      testUpstreamKey,
+		ChannelID:          42,
+		ConnectionRevision: 1,
+		ChannelName:        "test-channel",
+		BaseURL:            server.URL + "/v1",
+		Protocol:           protocol,
+		APIKey:             testUpstreamKey,
 	}
 }
 
@@ -822,7 +823,11 @@ func TestProbeSuccessRecordsHealth(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			server, requests := newCaptureServer(t, http.StatusOK, `{"ok":true}`)
+			fixture := validResponsesProbe
+			if test.protocol == store.ChannelProtocolOpenAIChat {
+				fixture = validChatProbe
+			}
+			server, requests := newCaptureServer(t, http.StatusOK, fixture)
 			recorder := &fakeHealthRecorder{}
 			prober, err := NewProber(newTestClient(t, Options{}), recorder)
 			if err != nil {
@@ -890,6 +895,13 @@ func TestProbeSuccessRecordsHealth(t *testing.T) {
 			}
 			if call.Health.At.IsZero() {
 				t.Error("health.At 不能为零值")
+			}
+			if call.Health.ConnectionRevision != 1 || call.Health.Model != "gpt-upstream" ||
+				call.Health.Protocol != test.protocol || call.Health.Kind != "generation" {
+				t.Errorf("健康证据绑定错误：%+v", call.Health)
+			}
+			if call.Health.DurationMS == nil || *call.Health.DurationMS != result.DurationMS || result.DurationMS < result.LatencyMS {
+				t.Errorf("耗时记录错误：result=%+v health=%+v", result, call.Health)
 			}
 		})
 	}
@@ -969,7 +981,7 @@ func TestProbeTimeoutReturnsUnhealthy(t *testing.T) {
 }
 
 func TestProbeHealthRecorderErrorIsReturned(t *testing.T) {
-	server, requests := newCaptureServer(t, http.StatusOK, `{"ok":true}`)
+	server, requests := newCaptureServer(t, http.StatusOK, validResponsesProbe)
 	recorder := &fakeHealthRecorder{err: errors.New("database unavailable")}
 	prober, err := NewProber(newTestClient(t, Options{}), recorder)
 	if err != nil {
@@ -988,7 +1000,7 @@ func TestProbeHealthRecorderErrorIsReturned(t *testing.T) {
 }
 
 func TestProbeWithoutRecorderStillReturnsResult(t *testing.T) {
-	server, requests := newCaptureServer(t, http.StatusOK, `{"ok":true}`)
+	server, requests := newCaptureServer(t, http.StatusOK, validResponsesProbe)
 	prober, err := NewProber(newTestClient(t, Options{}), nil)
 	if err != nil {
 		t.Fatalf("NewProber() 失败：%v", err)

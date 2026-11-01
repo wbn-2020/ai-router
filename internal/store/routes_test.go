@@ -447,6 +447,22 @@ func TestModelRoutesListModels(t *testing.T) {
 		t.Fatalf("ListModels = %v，期望 [alpha beta]", models)
 	}
 
+	// 按入站协议过滤：alpha 同时有 Responses/Chat 渠道，beta 只有 Chat。
+	responsesModels, err := routes.ListModelsByProtocol(ctx, ChannelProtocolOpenAIResponses)
+	if err != nil {
+		t.Fatalf("ListModelsByProtocol(responses): %v", err)
+	}
+	if len(responsesModels) != 1 || responsesModels[0] != "alpha" {
+		t.Fatalf("Responses 模型 = %v，期望 [alpha]", responsesModels)
+	}
+	chatModels, err := routes.ListModelsByProtocol(ctx, ChannelProtocolOpenAIChat)
+	if err != nil {
+		t.Fatalf("ListModelsByProtocol(chat): %v", err)
+	}
+	if len(chatModels) != 2 || chatModels[0] != "alpha" || chatModels[1] != "beta" {
+		t.Fatalf("Chat 模型 = %v，期望 [alpha beta]", chatModels)
+	}
+
 	// 禁用 alpha 的一条映射，alpha 仍由另一条启用映射支撑。
 	if _, err := routes.Update(ctx, alphaA.ID, ModelRouteInput{
 		ClientModel:   "alpha",

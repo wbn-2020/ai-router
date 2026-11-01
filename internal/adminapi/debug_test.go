@@ -56,7 +56,11 @@ func newDebugUpstreamStub(
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"resp_debug","object":"response","status":"completed","output":[]}`))
+		if strings.HasSuffix(r.URL.Path, "/chat/completions") {
+			_, _ = w.Write([]byte(`{"id":"chat_debug","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"resp_debug","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"pong"}]}]}`))
 	}))
 	t.Cleanup(stub.server.Close)
 	return stub
@@ -405,15 +409,12 @@ func TestDebugModelTest(t *testing.T) {
 
 // TestDebugProbeTimeout 覆盖探针超时与健康状态写回。
 func TestDebugProbeTimeout(t *testing.T) {
-	original := newDebugProbeClient
-	newDebugProbeClient = func() (*upstream.Client, error) {
-		return upstream.NewClient(upstream.Options{RequestTimeout: 60 * time.Millisecond})
-	}
-	t.Cleanup(func() {
-		newDebugProbeClient = original
-	})
-
 	api, st, _, cookie, logs := newChannelsAPI(t)
+	client, err := upstream.NewClient(upstream.Options{RequestTimeout: 60 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.probeClient = client
 	stub := newDebugUpstreamStub(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
 		select {
 		case <-r.Context().Done():
@@ -491,6 +492,72 @@ func TestDebugProbeErrorRedaction(t *testing.T) {
 	}
 	assertNoDebugSecrets(t, health.LastError,
 		testChannelKey, upstreamSecret, "query-secret", "api_key")
+}
+
+func TestDebugGenerationEvidenceAndContext(t *testing.T) {
+	for _, tc := range []struct {
+		name, protocol, body, status string
+	}{
+		{"arbitrary JSON", store.ChannelProtocolOpenAIResponses, `{"ok":true}`, "unhealthy"},
+		{"error envelope", store.ChannelProtocolOpenAIChat, `{"error":{"message":"sk-secret-should-not-leak"}}`, "unhealthy"},
+		{"empty response", store.ChannelProtocolOpenAIResponses, `{"status":"completed","output":[]}`, "unhealthy"},
+		{"truncated chat", store.ChannelProtocolOpenAIChat, `{"object":"chat.completion","choices":[{"message":{"role":"assistant","content":""},"finish_reason":"length"}]}`, "inconclusive"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			api, st, _, cookie, logs := newChannelsAPI(t)
+			stub := newDebugUpstreamStub(t, func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.body))
+			})
+			channel := createDebugChannel(t, api, cookie, "evidence", stub.URL(), tc.protocol, 0, true)
+			createDebugRoute(t, api, cookie, "alias", channel.ID, "actual-model", 0, true)
+			rec := apiRequest(t, api, http.MethodPost, debugChannelTestPath(channel.ID), nil, testOrigin, cookie)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			result := decodeBody[debugTestResponse](t, rec)
+			if result.Status != tc.status || result.ErrorCode == "" || result.DurationMS < result.LatencyMS {
+				t.Fatalf("result=%+v", result)
+			}
+			if result.Protocol != tc.protocol || result.Kind != "generation" || result.ConnectionRevision != channel.ConnectionRevision || result.ConnectionRevision < 1 {
+				t.Fatalf("missing probe context: %+v", result)
+			}
+			detail := apiRequest(t, api, http.MethodGet, "/admin/api/channels/"+intString(channel.ID), nil, "", cookie)
+			view := decodeBody[channelView](t, detail)
+			if view.LastHealthRevision != channel.ConnectionRevision || view.LastHealthModel != "actual-model" || view.LastHealthProtocol != tc.protocol || view.LastHealthKind != "generation" || view.LastHealthDurationMS == nil {
+				t.Fatalf("missing health context: %+v", view)
+			}
+			if readDebugHealth(t, st, channel.ID).Status != tc.status {
+				t.Fatal("health status differs from probe")
+			}
+			assertNoDebugSecrets(t, rec.Body.String()+detail.Body.String()+logs.String(), "sk-secret-should-not-leak", testChannelKey)
+		})
+	}
+}
+
+func TestDebugProbeUsesTotalBudget(t *testing.T) {
+	api, _, _, cookie, _ := newChannelsAPI(t)
+	api.probeTimeout = 30 * time.Millisecond
+	stub := newDebugUpstreamStub(t, func(w http.ResponseWriter, r *http.Request, _ []byte) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(time.Second):
+		}
+	})
+	channel := createDebugChannel(t, api, cookie, "budget", stub.URL(), store.ChannelProtocolOpenAIResponses, 0, true)
+	createDebugRoute(t, api, cookie, "alias", channel.ID, "model", 0, true)
+	started := time.Now()
+	rec := apiRequest(t, api, http.MethodPost, debugChannelTestPath(channel.ID), nil, testOrigin, cookie)
+	if rec.Code != http.StatusOK || time.Since(started) >= 500*time.Millisecond {
+		t.Fatalf("probe budget not applied: status=%d body=%s elapsed=%s", rec.Code, rec.Body.String(), time.Since(started))
+	}
+	result := decodeBody[debugTestResponse](t, rec)
+	if result.Status == "healthy" || result.ErrorCode == "" || result.DurationMS < 20 {
+		t.Fatalf("budget result=%+v", result)
+	}
 }
 
 // TestDebugRequiresSession 覆盖认证与同源校验。
