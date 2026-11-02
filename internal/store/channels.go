@@ -266,13 +266,17 @@ func (r *Channels) CreateWithModels(
 
 	routes := make([]ModelRoute, 0, len(normalizedModels))
 	for _, model := range normalizedModels {
-		route, insertErr := insertModelRoute(ctx, tx, ModelRouteInput{
+		input, normalizeErr := normalizeModelRouteInput(ModelRouteInput{
 			ClientModel:   model,
 			ChannelID:     channel.ID,
 			UpstreamModel: model,
 			Priority:      0,
 			Enabled:       true,
-		}, now)
+		})
+		if normalizeErr != nil {
+			return Channel{}, nil, normalizeErr
+		}
+		route, insertErr := insertModelRoute(ctx, tx, input, now)
 		if insertErr != nil {
 			return Channel{}, nil, insertErr
 		}

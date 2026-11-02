@@ -597,6 +597,14 @@ type streamAttemptRuntime struct {
 	requestAt   time.Time
 }
 
+// recordFailure 在有状态请求上不写熔断：失败可能只是该上游没有这段状态。
+func (s *StreamProxy) recordFailure(rt streamAttemptRuntime, failure proxyFailure, status int) {
+	if rt.info.Stateful {
+		return
+	}
+	s.scheduler.RecordFailure(rt.candidate, failure.routingFailure(status))
+}
+
 // ServeHTTP 执行流式失败切换。
 func (s *StreamProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s == nil || s.scheduler == nil || s.upstream == nil || s.journal == nil {
@@ -631,13 +639,17 @@ func (s *StreamProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, firstBudget := startFirstContentBudget(requestCtx, s.firstContentTimeout)
 	defer firstBudget.close()
 
-	attempts := make([]observability.RequestAttempt, 0, s.maxAttempts)
-	excluded := make(map[int64]struct{}, s.maxAttempts)
+	maxAttempts := s.maxAttempts
+	if info.PinnedChannelID > 0 {
+		maxAttempts = 1
+	}
+	attempts := make([]observability.RequestAttempt, 0, maxAttempts)
+	excluded := make(map[int64]struct{}, maxAttempts)
 	var lastFailure *proxyFailure
 	var lastTTFT *int64
 	var responseBytes *int64
 
-	for len(attempts) < s.maxAttempts {
+	for len(attempts) < maxAttempts {
 		if err := ctx.Err(); err != nil {
 			failure := requestFailure(ctx, err)
 			httpStatus := failure.Status
@@ -650,8 +662,23 @@ func (s *StreamProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		candidate, slot, err := s.scheduler.AcquireExcluding(
-			ctx, info.Model, info.Protocol, excluded)
+		var candidate routing.Candidate
+		var slot *routing.Slot
+		var err error
+		if info.PinnedChannelID > 0 {
+			pinned, ok := s.scheduler.(pinnedScheduler)
+			if !ok {
+				failure := schedulingFailure(errors.New("gateway: 调度器不支持钉住渠道"))
+				writeFailure(w, failure, s.writeTimeout)
+				s.recordStreamRequest(requestID, info, attempts,
+					observability.StatusError, &failure.Status, &failure, false, nil, nil, requestAt)
+				return
+			}
+			candidate, slot, err = pinned.AcquirePinned(ctx, info.PinnedChannelID, info.Model, info.Protocol)
+		} else {
+			candidate, slot, err = s.scheduler.AcquireExcluding(
+				ctx, info.Model, info.Protocol, excluded)
+		}
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				failure := requestFailure(ctx, err)
@@ -772,7 +799,7 @@ func (s *StreamProxy) runStreamAttempt(
 	key, err := s.decryptKey(rt.candidate.Channel.KeyCiphertext)
 	if err != nil || strings.TrimSpace(key) == "" {
 		failure := upstreamConfigurationFailure()
-		s.scheduler.RecordFailure(rt.candidate, failure.routingFailure(0))
+		s.recordFailure(rt, failure, 0)
 		return s.streamFailureResult(rt, attemptStarted, nil, &failure, false, 0, nil)
 	}
 
@@ -791,7 +818,7 @@ func (s *StreamProxy) runStreamAttempt(
 	if err != nil {
 		failure := requestFailure(rt.ctx, err)
 		if !failure.Canceled {
-			s.scheduler.RecordFailure(rt.candidate, failure.routingFailure(0))
+			s.recordFailure(rt, failure, 0)
 		}
 		return s.streamFailureResult(rt, attemptStarted, nil, &failure, false, 0, nil)
 	}
@@ -817,7 +844,7 @@ func (s *StreamProxy) runStreamAttempt(
 			failure = requestFailure(rt.ctx, rt.ctx.Err())
 		}
 		if !failure.Canceled {
-			s.scheduler.RecordFailure(rt.candidate, failure.routingFailure(upstreamStatus))
+			s.recordFailure(rt, failure, upstreamStatus)
 		}
 		return s.streamFailureResult(rt, attemptStarted, &upstreamStatus, &failure, false, 0, nil)
 	}
@@ -842,7 +869,7 @@ func (s *StreamProxy) runStreamAttempt(
 				Message: "Upstream returned a non-streaming response.",
 				Retry:   true,
 			}
-			s.scheduler.RecordFailure(rt.candidate, failure.routingFailure(upstreamStatus))
+			s.recordFailure(rt, failure, upstreamStatus)
 			return s.streamFailureResult(rt, attemptStarted, &upstreamStatus, &failure, false, 0, nil)
 		}
 	}
@@ -883,7 +910,7 @@ func (s *StreamProxy) runStreamAttempt(
 						gate.written, gate.ttftMS)
 				}
 				failure := interruptedStreamFailure()
-				s.scheduler.RecordFailure(rt.candidate, failure.routingFailure(0))
+				s.recordFailure(rt, failure, 0)
 				if !gate.committed {
 					return s.streamFailureResult(rt, attemptStarted, &httpStatus,
 						&failure, false, 0, nil)
@@ -905,7 +932,7 @@ func (s *StreamProxy) runStreamAttempt(
 				return s.streamFailureResult(rt, attemptStarted, &httpStatus,
 					&failure, gate.committed, gate.written, gate.ttftMS)
 			}
-			s.scheduler.RecordFailure(rt.candidate, failure.routingFailure(0))
+			s.recordFailure(rt, failure, 0)
 			if !gate.committed {
 				return s.streamFailureResult(rt, attemptStarted, &httpStatus,
 					&failure, false, 0, nil)
@@ -926,7 +953,7 @@ func (s *StreamProxy) runStreamAttempt(
 			if class.failure {
 				failure = classifyStructuredFailure(failure, event.Data)
 			}
-			s.scheduler.RecordFailure(rt.candidate, failure.routingFailure(0))
+			s.recordFailure(rt, failure, 0)
 			if !gate.committed {
 				return s.streamFailureResult(rt, attemptStarted, &httpStatus,
 					&failure, false, 0, nil)
@@ -947,7 +974,7 @@ func (s *StreamProxy) runStreamAttempt(
 		} else if !gate.committed {
 			if err := gate.buffer(event.Raw); err != nil {
 				failure := streamBufferLimitFailure()
-				s.scheduler.RecordFailure(rt.candidate, failure.routingFailure(0))
+				s.recordFailure(rt, failure, 0)
 				return s.streamFailureResult(rt, attemptStarted, &httpStatus,
 					&failure, false, 0, nil)
 			}
@@ -962,7 +989,7 @@ func (s *StreamProxy) runStreamAttempt(
 		if class.terminal {
 			if class.incomplete {
 				failure := proxyFailure{Status: http.StatusOK, Code: "upstream_incomplete", Type: errorTypeServer, Message: "Upstream returned an incomplete response.", Scope: routing.FailureScopeRequest}
-				s.scheduler.RecordFailure(rt.candidate, failure.routingFailure(upstreamStatus))
+				s.recordFailure(rt, failure, upstreamStatus)
 				return s.streamFailureResult(rt, attemptStarted, &httpStatus, &failure, true, gate.written, gate.ttftMS)
 			}
 			s.scheduler.RecordSuccess(rt.candidate)

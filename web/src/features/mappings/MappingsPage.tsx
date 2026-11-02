@@ -14,6 +14,7 @@ import {
   type ModelRoute,
   type ModelRouteInput,
 } from './api';
+import { describeRouteCapability, hasDeclaredCapability } from './capability';
 
 /** PRIORITY_MIN / PRIORITY_MAX 与后端 model_routes.priority 校验范围一致。 */
 export const PRIORITY_MIN = 0;
@@ -912,6 +913,7 @@ export function MappingsPage(): ReactNode {
                                   <th scope="col">客户端模型</th>
                                   <th scope="col">渠道</th>
                                   <th scope="col">上游模型</th>
+                                  <th scope="col">能力</th>
                                   <th scope="col">优先级</th>
                                   <th scope="col">状态</th>
                                   <th scope="col">更新时间</th>
@@ -943,6 +945,11 @@ export function MappingsPage(): ReactNode {
                                       </td>
                                       <td>
                                         <code>{route.upstream_model}</code>
+                                      </td>
+                                      <td>
+                                        <span className={hasDeclaredCapability(route) ? undefined : 'muted'}>
+                                          {describeRouteCapability(route)}
+                                        </span>
                                       </td>
                                       <td>{route.priority}</td>
                                       <td>

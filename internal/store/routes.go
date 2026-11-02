@@ -23,7 +23,12 @@ import (
 //
 // 仓储不接触上游 Key，也不做协议转换；所有 SQL 均为参数化查询。
 const modelRouteColumns = `id, client_model, channel_id, upstream_model,
-	priority, enabled, created_at, updated_at`
+	priority, enabled, input_modalities, context_window, reasoning_levels,
+	created_at, updated_at`
+
+const modelRouteColumnsAliased = `r.id, r.client_model, r.channel_id, r.upstream_model,
+	r.priority, r.enabled, r.input_modalities, r.context_window, r.reasoning_levels,
+	r.created_at, r.updated_at`
 
 const (
 	modelRoutePriorityMin = 0
@@ -66,6 +71,9 @@ type ModelRouteDB interface {
 }
 
 // ModelRoute 是一条模型映射的完整持久化视图。
+//
+// InputModalities/ContextWindow/ReasoningLevels 是管理员声明的上游能力；
+// unknown 与 nil 表示未声明，不等于支持或拒绝。
 type ModelRoute struct {
 	ID            int64
 	ClientModel   string
@@ -74,17 +82,27 @@ type ModelRoute struct {
 	Priority      int
 	Enabled       bool
 
+	InputModalities string
+	ContextWindow   *int64
+	ReasoningLevels []string
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
 
 // ModelRouteInput 是创建或全量更新模型映射的输入。
+//
+// InputModalities 为空表示未声明；ContextWindow 为 0 表示未声明；
+// ReasoningLevels 为 nil/空表示未声明。全量更新用同样的零值清空能力。
 type ModelRouteInput struct {
-	ClientModel   string
-	ChannelID     int64
-	UpstreamModel string
-	Priority      int
-	Enabled       bool
+	ClientModel     string
+	ChannelID       int64
+	UpstreamModel   string
+	Priority        int
+	Enabled         bool
+	InputModalities string
+	ContextWindow   int64
+	ReasoningLevels []string
 }
 
 // ModelRoutes 提供 model_routes 表的 CRUD 与候选查询。
@@ -136,14 +154,18 @@ func insertModelRoute(
 	row := exec.QueryRowContext(ctx, `
 		INSERT INTO model_routes (
 			client_model, channel_id, upstream_model, priority, enabled,
+			input_modalities, context_window, reasoning_levels,
 			created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		RETURNING `+modelRouteColumns,
 		input.ClientModel,
 		input.ChannelID,
 		input.UpstreamModel,
 		input.Priority,
 		boolToInt(input.Enabled),
+		input.InputModalities,
+		nullableContextWindow(input.ContextWindow),
+		reasoningLevelsArg(input.ReasoningLevels),
 		now,
 		now,
 	)
@@ -207,8 +229,7 @@ func (r *ModelRoutes) ListByModelAndProtocol(
 	}
 
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT r.id, r.client_model, r.channel_id, r.upstream_model,
-			r.priority, r.enabled, r.created_at, r.updated_at
+		SELECT `+modelRouteColumnsAliased+`
 		FROM model_routes AS r
 		JOIN channels AS c ON c.id = r.channel_id
 		WHERE r.client_model = ?
@@ -220,6 +241,33 @@ func (r *ModelRoutes) ListByModelAndProtocol(
 		clientModel, protocol)
 	if err != nil {
 		return nil, fmt.Errorf("store: 查询候选模型映射失败：%w", err)
+	}
+	defer rows.Close()
+	return collectModelRoutes(rows)
+}
+
+// ListByProtocol 返回指定入站协议下全部可服务映射（启用映射 + 启用渠道 +
+// 协议匹配），按 client_model、priority、id 稳定排序。
+//
+// 供 Codex manifest 按别名聚合共同能力；空协议返回空集合。
+func (r *ModelRoutes) ListByProtocol(ctx context.Context, protocol string) ([]ModelRoute, error) {
+	if r == nil || r.db == nil {
+		return nil, errors.New("store: 模型映射仓储未初始化")
+	}
+	protocol = strings.TrimSpace(protocol)
+	if protocol == "" {
+		return make([]ModelRoute, 0), nil
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT `+modelRouteColumnsAliased+`
+		FROM model_routes AS r
+		JOIN channels AS c ON c.id = r.channel_id
+		WHERE r.enabled = 1 AND c.enabled = 1 AND c.protocol = ?
+		ORDER BY r.client_model ASC, r.priority ASC,
+			c.priority ASC, julianday(c.last_used_at) ASC, r.id ASC`,
+		protocol)
+	if err != nil {
+		return nil, fmt.Errorf("store: 按协议列出模型映射失败：%w", err)
 	}
 	defer rows.Close()
 	return collectModelRoutes(rows)
@@ -299,7 +347,9 @@ func (r *ModelRoutes) Update(ctx context.Context, id int64, in ModelRouteInput) 
 	row := r.db.QueryRowContext(ctx, `
 		UPDATE model_routes SET
 			client_model = ?, channel_id = ?, upstream_model = ?,
-			priority = ?, enabled = ?, updated_at = ?
+			priority = ?, enabled = ?,
+			input_modalities = ?, context_window = ?, reasoning_levels = ?,
+			updated_at = ?
 		WHERE id = ?
 		RETURNING `+modelRouteColumns,
 		input.ClientModel,
@@ -307,6 +357,9 @@ func (r *ModelRoutes) Update(ctx context.Context, id int64, in ModelRouteInput) 
 		input.UpstreamModel,
 		input.Priority,
 		boolToInt(input.Enabled),
+		input.InputModalities,
+		nullableContextWindow(input.ContextWindow),
+		reasoningLevelsArg(input.ReasoningLevels),
 		formatChannelTime(time.Now()),
 		id,
 	)
@@ -376,10 +429,38 @@ func normalizeModelRouteInput(in ModelRouteInput) (ModelRouteInput, error) {
 	if in.Priority < modelRoutePriorityMin || in.Priority > modelRoutePriorityMax {
 		return ModelRouteInput{}, invalidModelRoute("priority 必须为 0-1000")
 	}
+	modalities, window, levels, err := normalizeCapabilities(in.InputModalities, in.ContextWindow, in.ReasoningLevels)
+	if err != nil {
+		return ModelRouteInput{}, err
+	}
 
 	in.ClientModel = clientModel
 	in.UpstreamModel = upstreamModel
+	in.InputModalities = modalities
+	in.ReasoningLevels = levels
+	if window == nil {
+		in.ContextWindow = 0
+	} else {
+		in.ContextWindow = *window
+	}
 	return in, nil
+}
+
+// nullableContextWindow 把 0 映射为 SQL NULL（未声明）。
+func nullableContextWindow(window int64) any {
+	if window <= 0 {
+		return nil
+	}
+	return window
+}
+
+// reasoningLevelsArg 把档位编码为 JSON 文本；空档位写 NULL。
+func reasoningLevelsArg(levels []string) any {
+	encoded, err := encodeReasoningLevels(levels)
+	if err != nil {
+		return nil
+	}
+	return encoded
 }
 
 func invalidModelRoute(reason string) error {
@@ -435,6 +516,8 @@ func scanModelRoute(scanner modelRouteScanner) (ModelRoute, error) {
 	var (
 		route     ModelRoute
 		enabled   int
+		window    sql.NullInt64
+		levels    sql.NullString
 		createdAt string
 		updatedAt string
 	)
@@ -445,12 +528,29 @@ func scanModelRoute(scanner modelRouteScanner) (ModelRoute, error) {
 		&route.UpstreamModel,
 		&route.Priority,
 		&enabled,
+		&route.InputModalities,
+		&window,
+		&levels,
 		&createdAt,
 		&updatedAt,
 	); err != nil {
 		return ModelRoute{}, err
 	}
 	route.Enabled = enabled != 0
+	if route.InputModalities == "" {
+		route.InputModalities = ModelModalitiesUnknown
+	}
+	if window.Valid {
+		value := window.Int64
+		route.ContextWindow = &value
+	}
+	if levels.Valid {
+		decoded, err := decodeReasoningLevels(levels.String)
+		if err != nil {
+			return ModelRoute{}, err
+		}
+		route.ReasoningLevels = decoded
+	}
 
 	created, err := time.Parse(channelTimeLayout, createdAt)
 	if err != nil {

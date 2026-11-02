@@ -69,6 +69,11 @@ var (
 	_ http.Handler       = (*Proxy)(nil)
 )
 
+// pinnedScheduler 是有状态请求需要的“钉住渠道”能力；*routing.Scheduler 满足。
+type pinnedScheduler interface {
+	AcquirePinned(ctx context.Context, channelID int64, clientModel, protocol string) (routing.Candidate, *routing.Slot, error)
+}
+
 // ProxyOptions 是 Proxy 的构造参数。
 //
 // Scheduler/Upstream/Journal/DecryptKey 必须非 nil。DecryptKey 只接收
@@ -216,19 +221,37 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, info RequestInfo
 	r = r.WithContext(ctx)
 	startedAt := p.now()
 	requestID := p.requestID(r)
-	attempts := make([]observability.RequestAttempt, 0, p.maxAttempts)
-	excluded := make(map[int64]struct{}, p.maxAttempts)
+	maxAttempts := p.maxAttempts
+	if info.PinnedChannelID > 0 {
+		maxAttempts = 1
+	}
+	attempts := make([]observability.RequestAttempt, 0, maxAttempts)
+	excluded := make(map[int64]struct{}, maxAttempts)
 
 	var lastFailure *proxyFailure
-	for len(attempts) < p.maxAttempts {
+	for len(attempts) < maxAttempts {
 		if err := r.Context().Err(); err != nil {
 			failure := requestFailure(r.Context(), err)
 			p.finishFailure(w, requestID, info, attempts, startedAt, &failure, attemptStatus(failure))
 			return
 		}
 
-		candidate, slot, err := p.scheduler.AcquireExcluding(
-			r.Context(), info.Model, info.Protocol, excluded)
+		var candidate routing.Candidate
+		var slot *routing.Slot
+		var err error
+		if info.PinnedChannelID > 0 {
+			pinned, ok := p.scheduler.(pinnedScheduler)
+			if !ok {
+				failure := schedulingFailure(errors.New("gateway: 调度器不支持钉住渠道"))
+				p.finishFailure(w, requestID, info, attempts, startedAt, &failure, observability.StatusError)
+				return
+			}
+			candidate, slot, err = pinned.AcquirePinned(
+				r.Context(), info.PinnedChannelID, info.Model, info.Protocol)
+		} else {
+			candidate, slot, err = p.scheduler.AcquireExcluding(
+				r.Context(), info.Model, info.Protocol, excluded)
+		}
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				failure := requestFailure(r.Context(), err)
@@ -247,7 +270,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, info RequestInfo
 
 		attemptIndex := len(attempts) + 1
 		outcome := p.runAttempt(
-			r.Context(), requestID, attemptIndex, candidate, slot, body, r.Header)
+			r.Context(), requestID, attemptIndex, candidate, slot, body, r.Header, info.Stateful)
 
 		if outcome.failure == nil && outcome.response != nil {
 			upstreamStatus := outcome.response.status
@@ -336,6 +359,7 @@ func (p *Proxy) runAttempt(
 	slot *routing.Slot,
 	body []byte,
 	headers http.Header,
+	stateful bool,
 ) attemptOutcome {
 	defer slot.Release()
 	startedAt := p.now()
@@ -343,7 +367,11 @@ func (p *Proxy) runAttempt(
 	key, err := p.decryptKey(candidate.Channel.KeyCiphertext)
 	if err != nil || strings.TrimSpace(key) == "" {
 		failure := upstreamConfigurationFailure()
-		p.scheduler.RecordFailure(candidate, failure.routingFailure(0))
+		if !stateful {
+			if !stateful {
+				p.scheduler.RecordFailure(candidate, failure.routingFailure(0))
+			}
+		}
 		return attemptOutcome{
 			record: newAttemptRecord(requestID, index, candidate,
 				observability.StatusError, nil, &failure, false, startedAt, p.now()),
@@ -367,7 +395,11 @@ func (p *Proxy) runAttempt(
 		failure := requestFailure(ctx, err)
 		if !failure.Canceled {
 			// 网关预算使用 request scope，不处罚上游渠道。
-			p.scheduler.RecordFailure(candidate, failure.routingFailure(0))
+			if !stateful {
+				if !stateful {
+					p.scheduler.RecordFailure(candidate, failure.routingFailure(0))
+				}
+			}
 		}
 		return attemptOutcome{
 			record: newAttemptRecord(requestID, index, candidate,
@@ -401,7 +433,11 @@ func (p *Proxy) runAttempt(
 		if readErr != nil {
 			failure := requestFailure(ctx, readErr)
 			if !failure.Canceled {
-				p.scheduler.RecordFailure(candidate, failure.routingFailure(0))
+				if !stateful {
+					if !stateful {
+						p.scheduler.RecordFailure(candidate, failure.routingFailure(0))
+					}
+				}
 			}
 			return attemptOutcome{
 				record: newAttemptRecord(requestID, index, candidate,
@@ -416,7 +452,11 @@ func (p *Proxy) runAttempt(
 				Type:    errorTypeServer,
 				Message: "Upstream response is too large.",
 			}
-			p.scheduler.RecordFailure(candidate, failure.routingFailure(0))
+			if !stateful {
+				if !stateful {
+					p.scheduler.RecordFailure(candidate, failure.routingFailure(0))
+				}
+			}
 			return attemptOutcome{
 				record: newAttemptRecord(requestID, index, candidate,
 					observability.StatusError, nil, &failure, false, startedAt, p.now()),
@@ -444,7 +484,9 @@ func (p *Proxy) runAttempt(
 		failure = requestFailure(ctx, ctx.Err())
 	}
 	if !failure.Canceled {
-		p.scheduler.RecordFailure(candidate, failure.routingFailure(response.StatusCode))
+		if !stateful {
+			p.scheduler.RecordFailure(candidate, failure.routingFailure(response.StatusCode))
+		}
 	}
 	statusCode := response.StatusCode
 	return attemptOutcome{

@@ -186,6 +186,30 @@ async function openMore(user: ReturnType<typeof userEvent.setup>, name: string) 
   }
 }
 
+/** openCapabilityFields 展开表单里的“能力声明（可选）”，已展开时保持原状。 */
+async function openCapabilityFields(
+  user: ReturnType<typeof userEvent.setup>,
+  form: HTMLElement,
+): Promise<void> {
+  const summary = within(form).getByText('能力声明（可选）');
+  const details = summary.closest('details');
+  if (details !== null && !details.open) {
+    await user.click(summary);
+  }
+}
+
+/** openModelsDialog 打开渠道编辑抽屉并等待模型列表加载完成。 */
+async function openModelsDialog(
+  user: ReturnType<typeof userEvent.setup>,
+  channelName = PRIMARY.name,
+): Promise<HTMLElement> {
+  await screen.findByText(channelName);
+  await user.click(screen.getByRole('button', { name: `编辑渠道 ${channelName}` }));
+  const dialog = await screen.findByRole('dialog');
+  await within(dialog).findByRole('button', { name: '编辑模型 codex-alias' });
+  return dialog;
+}
+
 /** fake 后端只在内存中保留 Key；所有端点由 fetch stub 截获。 */
 function createBackend(initialChannels: Channel[], initialSecrets: Record<number, string>, initialRoutes: ModelRoute[] = []) {
   const channels = initialChannels.map((channel) => ({ ...channel }));
@@ -651,6 +675,244 @@ describe('渠道编辑：连接、模型与单次检查', () => {
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
     expect(editButton).toHaveFocus();
     expect(callsFor(fetchMock, '/admin/api/channels', 'GET')).toHaveLength(2);
+  });
+});
+
+describe('渠道模型能力声明', () => {
+  it('编辑表单预填能力，只提交被修改的能力字段', async () => {
+    const route = modelRoute({
+      input_modalities: 'text',
+      context_window: 32000,
+      reasoning_levels: ['low', 'high'],
+    });
+    const backend = createBackend([PRIMARY], { 1: SECRET_PRIMARY }, [route]);
+    const fetchMock = installFetch(backend.handler);
+    const user = userEvent.setup();
+
+    render(<ChannelsPage />);
+    const dialog = await openModelsDialog(user);
+    await user.click(await within(dialog).findByRole('button', { name: '编辑模型 codex-alias' }));
+    const edit = within(dialog).getByRole('form', { name: '编辑模型映射' });
+    await openCapabilityFields(user, edit);
+
+    expect(within(edit).getByLabelText('输入模态')).toHaveValue('text');
+    expect(within(edit).getByLabelText('上下文窗口')).toHaveValue(32000);
+    expect(within(edit).getByRole('checkbox', { name: 'low' })).toBeChecked();
+    expect(within(edit).getByRole('checkbox', { name: 'high' })).toBeChecked();
+    expect(within(edit).getByRole('checkbox', { name: 'medium' })).not.toBeChecked();
+
+    await user.selectOptions(within(edit).getByLabelText('输入模态'), 'text_image');
+    await user.click(within(edit).getByRole('button', { name: '保存模型映射' }));
+    await within(dialog).findByText('模型映射已更新。');
+
+    const patches = callsFor(fetchMock, '/admin/api/model-routes/11', 'PATCH');
+    expect(patches).toHaveLength(1);
+    expect(JSON.parse(String(patches[0]?.[1]?.body))).toEqual({
+      client_model: 'codex-alias',
+      upstream_model: 'gpt-5.1-codex',
+      priority: 7,
+      input_modalities: 'text_image',
+    });
+    expect(backend.routes[0]).toMatchObject({
+      id: route.id,
+      input_modalities: 'text_image',
+      context_window: 32000,
+      reasoning_levels: ['low', 'high'],
+    });
+  });
+
+  it('清空窗口与档位时发送 0 / []，重新编辑回到未声明', async () => {
+    const route = modelRoute({
+      input_modalities: 'text_image',
+      context_window: 128000,
+      reasoning_levels: ['low', 'medium'],
+    });
+    const backend = createBackend([PRIMARY], { 1: SECRET_PRIMARY }, [route]);
+    const fetchMock = installFetch(backend.handler);
+    const user = userEvent.setup();
+
+    render(<ChannelsPage />);
+    const dialog = await openModelsDialog(user);
+    await user.click(await within(dialog).findByRole('button', { name: '编辑模型 codex-alias' }));
+    const edit = within(dialog).getByRole('form', { name: '编辑模型映射' });
+    await openCapabilityFields(user, edit);
+
+    await user.selectOptions(within(edit).getByLabelText('输入模态'), 'unknown');
+    await user.clear(within(edit).getByLabelText('上下文窗口'));
+    await user.click(within(edit).getByRole('checkbox', { name: 'low' }));
+    await user.click(within(edit).getByRole('checkbox', { name: 'medium' }));
+    await user.click(within(edit).getByRole('button', { name: '保存模型映射' }));
+    await within(dialog).findByText('模型映射已更新。');
+
+    const patches = callsFor(fetchMock, '/admin/api/model-routes/11', 'PATCH');
+    expect(patches).toHaveLength(1);
+    expect(JSON.parse(String(patches[0]?.[1]?.body))).toEqual({
+      client_model: 'codex-alias',
+      upstream_model: 'gpt-5.1-codex',
+      priority: 7,
+      input_modalities: 'unknown',
+      context_window: 0,
+      reasoning_levels: [],
+    });
+
+    await user.click(await within(dialog).findByRole('button', { name: '编辑模型 codex-alias' }));
+    const reopened = within(dialog).getByRole('form', { name: '编辑模型映射' });
+    await openCapabilityFields(user, reopened);
+    expect(within(reopened).getByLabelText('输入模态')).toHaveValue('unknown');
+    expect(within(reopened).getByLabelText('上下文窗口')).toHaveValue(null);
+    for (const level of ['low', 'medium']) {
+      expect(within(reopened).getByRole('checkbox', { name: level })).not.toBeChecked();
+    }
+  });
+
+  it('窗口越界只显示行内错误且不发 PATCH，合法值可保存', async () => {
+    const backend = createBackend([PRIMARY], { 1: SECRET_PRIMARY }, [modelRoute()]);
+    const fetchMock = installFetch(backend.handler);
+    const user = userEvent.setup();
+
+    render(<ChannelsPage />);
+    const dialog = await openModelsDialog(user);
+    await user.click(await within(dialog).findByRole('button', { name: '编辑模型 codex-alias' }));
+    const edit = within(dialog).getByRole('form', { name: '编辑模型映射' });
+    await openCapabilityFields(user, edit);
+    const windowInput = within(edit).getByLabelText('上下文窗口');
+
+    for (const invalid of ['10000001', '0', '-1']) {
+      fireEvent.change(windowInput, { target: { value: invalid } });
+      await user.click(within(edit).getByRole('button', { name: '保存模型映射' }));
+      expect(within(edit).getByText('上下文窗口必须是 1 到 10000000 的整数，或留空表示未声明。'))
+        .toBeInTheDocument();
+      expect(windowInput).toHaveAttribute('aria-invalid', 'true');
+      expect(callsFor(fetchMock, '/admin/api/model-routes/11', 'PATCH')).toHaveLength(0);
+    }
+
+    fireEvent.change(windowInput, { target: { value: '32000' } });
+    await user.click(within(edit).getByRole('button', { name: '保存模型映射' }));
+    await within(dialog).findByText('模型映射已更新。');
+    const patches = callsFor(fetchMock, '/admin/api/model-routes/11', 'PATCH');
+    expect(patches).toHaveLength(1);
+    expect(JSON.parse(String(patches[0]?.[1]?.body))).toEqual({
+      client_model: 'codex-alias',
+      upstream_model: 'gpt-5.1-codex',
+      priority: 7,
+      context_window: 32000,
+    });
+  });
+
+  it('手动添加可声明能力，留空时创建请求仍只含五个基础字段', async () => {
+    const backend = createBackend([PRIMARY], { 1: SECRET_PRIMARY });
+    const fetchMock = installFetch(backend.handler);
+    const user = userEvent.setup();
+
+    render(<ChannelsPage />);
+    await screen.findByText(PRIMARY.name);
+    await user.click(screen.getByRole('button', { name: '编辑渠道 codex-primary' }));
+    const dialog = await screen.findByRole('dialog');
+    const manual = within(dialog).getByRole('form', { name: '手动添加模型映射' });
+    await openCapabilityFields(user, manual);
+
+    await user.type(within(manual).getByLabelText('客户端模型'), 'vision-alias');
+    await user.type(within(manual).getByLabelText('上游模型（留空同名）'), 'vision-upstream');
+    await user.selectOptions(within(manual).getByLabelText('输入模态'), 'text_image');
+    await user.type(within(manual).getByLabelText('上下文窗口'), '64000');
+    await user.click(within(manual).getByRole('checkbox', { name: 'high' }));
+    await user.click(within(manual).getByRole('button', { name: '手动添加' }));
+    await within(dialog).findByText('已添加模型「vision-alias」。');
+    expect(within(manual).getByLabelText('输入模态')).toHaveValue('unknown');
+    expect(within(manual).getByLabelText('上下文窗口')).toHaveValue(null);
+
+    await user.type(within(manual).getByLabelText('客户端模型'), 'plain-alias');
+    await user.type(within(manual).getByLabelText('上游模型（留空同名）'), 'plain-upstream');
+    await user.click(within(manual).getByRole('button', { name: '手动添加' }));
+    await within(dialog).findByText('已添加模型「plain-alias」。');
+
+    const posts = callsFor(fetchMock, '/admin/api/model-routes', 'POST');
+    expect(posts).toHaveLength(2);
+    expect(JSON.parse(String(posts[0]?.[1]?.body))).toEqual({
+      client_model: 'vision-alias',
+      channel_id: 1,
+      upstream_model: 'vision-upstream',
+      priority: 0,
+      enabled: true,
+      input_modalities: 'text_image',
+      context_window: 64000,
+      reasoning_levels: ['high'],
+    });
+    expect(JSON.parse(String(posts[1]?.[1]?.body))).toEqual({
+      client_model: 'plain-alias',
+      channel_id: 1,
+      upstream_model: 'plain-upstream',
+      priority: 0,
+      enabled: true,
+    });
+  });
+
+  it('保存失败保留能力输入并显示后端安全文案，不显示上游 Key', async () => {
+    const backend = createBackend([PRIMARY], { 1: SECRET_PRIMARY }, [modelRoute()]);
+    installFetch((url, init) => {
+      if (url === '/admin/api/model-routes/11' && init.method === 'PATCH') {
+        return jsonResponse(
+          { error: 'invalid_model_route', message: 'context_window 必须为 1-10000000 或留空' },
+          400,
+        );
+      }
+      return backend.handler(url, init);
+    });
+    const user = userEvent.setup();
+
+    render(<ChannelsPage />);
+    const dialog = await openModelsDialog(user);
+    await user.click(await within(dialog).findByRole('button', { name: '编辑模型 codex-alias' }));
+    const edit = within(dialog).getByRole('form', { name: '编辑模型映射' });
+    await openCapabilityFields(user, edit);
+
+    await user.selectOptions(within(edit).getByLabelText('输入模态'), 'text');
+    await user.type(within(edit).getByLabelText('上下文窗口'), '32000');
+    await user.click(within(edit).getByRole('checkbox', { name: 'high' }));
+    await user.click(within(edit).getByRole('button', { name: '保存模型映射' }));
+
+    expect(await within(dialog).findByText('context_window 必须为 1-10000000 或留空'))
+      .toBeInTheDocument();
+    expect(within(edit).getByLabelText('输入模态')).toHaveValue('text');
+    expect(within(edit).getByLabelText('上下文窗口')).toHaveValue(32000);
+    expect(within(edit).getByRole('checkbox', { name: 'high' })).toBeChecked();
+    expect(screen.queryByDisplayValue(SECRET_PRIMARY)).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue(SECRET_BACKUP)).not.toBeInTheDocument();
+  });
+
+  it('启停只发送 enabled，切换后能力声明保持不变', async () => {
+    const backend = createBackend([PRIMARY], { 1: SECRET_PRIMARY }, [modelRoute({
+      input_modalities: 'text',
+      context_window: 32000,
+      reasoning_levels: ['low', 'high'],
+    })]);
+    const fetchMock = installFetch(backend.handler);
+    const user = userEvent.setup();
+
+    render(<ChannelsPage />);
+    const dialog = await openModelsDialog(user);
+    await user.click(within(dialog).getByRole('switch', { name: '启用模型 codex-alias' }));
+    await waitFor(() => {
+      expect(within(dialog).getByRole('switch', { name: '启用模型 codex-alias' }))
+        .toHaveAttribute('aria-checked', 'false');
+    });
+
+    const patches = callsFor(fetchMock, '/admin/api/model-routes/11', 'PATCH');
+    expect(patches).toHaveLength(1);
+    expect(JSON.parse(String(patches[0]?.[1]?.body))).toEqual({ enabled: false });
+    expect(backend.routes[0]).toMatchObject({
+      enabled: false,
+      input_modalities: 'text',
+      context_window: 32000,
+      reasoning_levels: ['low', 'high'],
+    });
+
+    await user.click(within(dialog).getByRole('button', { name: '编辑模型 codex-alias' }));
+    const edit = within(dialog).getByRole('form', { name: '编辑模型映射' });
+    await openCapabilityFields(user, edit);
+    expect(within(edit).getByLabelText('输入模态')).toHaveValue('text');
+    expect(within(edit).getByLabelText('上下文窗口')).toHaveValue(32000);
+    expect(within(edit).getByRole('checkbox', { name: 'high' })).toBeChecked();
   });
 });
 

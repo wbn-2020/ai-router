@@ -602,6 +602,122 @@ describe('模型映射页', () => {
     expect(hasRequest(fetchMock, '/admin/api/model-routes', 'POST')).toBe(false);
   });
 
+  it('展开明细时按路由显示能力提示，未声明与部分声明可区分', async () => {
+    const routes: ModelRoute[] = [
+      {
+        ...CODEX_ROUTE,
+        input_modalities: 'text_image',
+        context_window: 32000,
+        reasoning_levels: ['low', 'high'],
+      },
+      {
+        ...CODEX_ROUTE,
+        id: 2,
+        channel_id: 2,
+        upstream_model: 'gpt-5.1-codex-chat',
+        input_modalities: 'text',
+        context_window: 128000,
+        reasoning_levels: [],
+      },
+      {
+        ...CODEX_ROUTE,
+        id: 3,
+        channel_id: 3,
+        upstream_model: 'gpt-5.1-codex-window',
+        context_window: 64000,
+      },
+      {
+        ...CODEX_ROUTE,
+        id: 4,
+        channel_id: 4,
+        upstream_model: 'gpt-5.1-codex-legacy',
+      },
+    ];
+    const thirdChannel = { ...CHAT_CHANNEL, id: 3, name: 'chat-third' };
+    const fourthChannel = { ...CHAT_CHANNEL, id: 4, name: 'chat-legacy' };
+    const backend = createBackend(routes, [
+      CODEX_CHANNEL,
+      CHAT_CHANNEL,
+      thirdChannel,
+      fourthChannel,
+    ]);
+    installFetch(backend.handler);
+    const user = userEvent.setup();
+
+    render(<MappingsPage />);
+
+    const group = await expandModel(user, 'gpt-5-codex');
+    expect(within(group).getByRole('columnheader', { name: '能力' })).toBeInTheDocument();
+
+    const declaredRow = rowOf(
+      screen.getByRole('button', { name: '编辑映射 gpt-5-codex → codex-primary' }),
+    );
+    expect(within(declaredRow).getByText('text+image · 32k · reasoning 2 档')).toBeInTheDocument();
+
+    const textRow = rowOf(
+      screen.getByRole('button', { name: '编辑映射 gpt-5-codex → chat-backup' }),
+    );
+    expect(within(textRow).getByText('text · 128k · 未声明')).toBeInTheDocument();
+
+    const windowRow = rowOf(
+      screen.getByRole('button', { name: '编辑映射 gpt-5-codex → chat-third' }),
+    );
+    expect(within(windowRow).getByText('未声明 · 64k · 未声明')).toBeInTheDocument();
+
+    const legacyRow = rowOf(
+      screen.getByRole('button', { name: '编辑映射 gpt-5-codex → chat-legacy' }),
+    );
+    expect(within(legacyRow).getByText('未声明')).toHaveClass('muted');
+  });
+
+  it('带能力声明的映射启停与编辑只发送基础字段，能力保持不变', async () => {
+    const route: ModelRoute = {
+      ...CODEX_ROUTE,
+      input_modalities: 'text_image',
+      context_window: 32000,
+      reasoning_levels: ['low', 'high'],
+    };
+    const backend = createBackend([route], [CODEX_CHANNEL]);
+    const fetchMock = installFetch(backend.handler);
+    const user = userEvent.setup();
+
+    render(<MappingsPage />);
+
+    await expandModel(user, 'gpt-5-codex');
+    await user.click(
+      screen.getByRole('button', { name: '禁用映射 gpt-5-codex → codex-primary' }),
+    );
+    expect(await screen.findByText('映射已禁用。')).toBeInTheDocument();
+    const togglePatches = callsFor(fetchMock, '/admin/api/model-routes/1', 'PATCH');
+    expect(togglePatches).toHaveLength(1);
+    expect(JSON.parse(String(togglePatches[0]?.[1]?.body))).toEqual({ enabled: false });
+    expect(screen.getByText('text+image · 32k · reasoning 2 档')).toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole('button', { name: '编辑映射 gpt-5-codex → codex-primary' }),
+    );
+    await user.clear(screen.getByLabelText('优先级'));
+    await user.type(screen.getByLabelText('优先级'), '12');
+    await user.click(screen.getByRole('button', { name: '保存修改' }));
+    expect(await screen.findByText('映射已更新。')).toBeInTheDocument();
+
+    const patches = callsFor(fetchMock, '/admin/api/model-routes/1', 'PATCH');
+    expect(patches).toHaveLength(2);
+    expect(JSON.parse(String(patches[1]?.[1]?.body))).toEqual({
+      client_model: 'gpt-5-codex',
+      channel_id: 1,
+      upstream_model: 'gpt-5.1-codex',
+      priority: 12,
+      enabled: false,
+    });
+    expect(backend.routes[0]).toMatchObject({
+      input_modalities: 'text_image',
+      context_window: 32000,
+      reasoning_levels: ['low', 'high'],
+    });
+    expect(screen.getByText('text+image · 32k · reasoning 2 档')).toBeInTheDocument();
+  });
+
   it('初始化 401 时跳转登录且不渲染映射内容', async () => {
     installFetch(() => jsonResponse({ error: 'unauthorized', message: '需要管理员登录' }, 401));
 

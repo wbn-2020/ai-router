@@ -4,12 +4,14 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"ai-router/internal/store"
 )
 
 // Codex 0.164.0 的模型选择器读取完整 ModelInfo descriptor，而不是普通
-// OpenAI /v1/models 的最简条目。除 slug/display_name 外，多个可空字段必须
-// 以 null 或空数组显式出现；缺失字段会让 Codex 的 Rust serde 解析失败或
-// 模型选择器为空。
+// OpenAI /v1/models 的最简条目。这里保留完整字段形状并显式输出 null/空
+// 数组以兼容已知客户端；字段集合不是 0.164 serde 的严格必需集，缺失字段
+// 不会必然导致解析失败，因此测试只强制核心字段，不把多余键当作契约。
 //
 // 本文件只依据已记录的协议字段构造 descriptor，不访问上游模型目录，也不
 // 暴露上游模型名、渠道或 Key。
@@ -129,24 +131,24 @@ type codexModelInfo struct {
 // GATEWAY_CODEX_CONTEXT_WINDOW，再回退到默认值。
 func newCodexManifestBuilder(configured int) codexManifestBuilder {
 	window := resolveCodexContextWindow(configured)
-	return func(models []string) any {
+	return func(models []ModelCapabilities) any {
 		return buildCodexManifest(models, window)
 	}
 }
 
-// buildCodexManifest 从启用映射的客户端模型生成完整 Codex manifest。
+// buildCodexManifest 从别名共同能力生成完整 Codex manifest。
 //
 // 空白模型名被跳过，重复模型名只保留首次出现，保证 slug 与启用的客户端
 // 模型一致且不重复。空列表返回合法的 {"models":[]}。
-func buildCodexManifest(models []string, contextWindow int) codexManifest {
+func buildCodexManifest(models []ModelCapabilities, contextWindow int) codexManifest {
 	if contextWindow <= 0 {
 		contextWindow = defaultCodexContextWindow
 	}
 
 	entries := make([]codexModelInfo, 0, len(models))
 	seen := make(map[string]struct{}, len(models))
-	for _, raw := range models {
-		slug := strings.TrimSpace(raw)
+	for _, capability := range models {
+		slug := strings.TrimSpace(capability.Slug)
 		if slug == "" {
 			continue
 		}
@@ -154,27 +156,50 @@ func buildCodexManifest(models []string, contextWindow int) codexManifest {
 			continue
 		}
 		seen[slug] = struct{}{}
-		entries = append(entries, newCodexModelInfo(slug, contextWindow))
+		entries = append(entries, newCodexModelInfo(capability, contextWindow))
 	}
 	return codexManifest{Models: entries}
 }
 
 // newCodexModelInfo 构造一个面向任意上游模型的完整 descriptor。
 //
-// 网关不做跨协议转换，也无法从手工映射推断上游能力；因此只声明最小、
-// 保守且协议合法的能力：文本+图片输入、不启用 reasoning/搜索/并行工具、
-// 上下文窗口由配置统一指定。
-func newCodexModelInfo(slug string, contextWindow int) codexModelInfo {
+// 能力来自逐路由声明的共同值：窗口取声明值与全局配置的较小者；模态在
+// 任一候选显式 text 时收窄为纯文本；推理档位取交集，未声明时回退 none。
+// 未声明不冒充“已支持”，也不在没有证据时收窄成拒绝。
+func newCodexModelInfo(capability ModelCapabilities, contextWindow int) codexModelInfo {
+	slug := strings.TrimSpace(capability.Slug)
 	window := int64(contextWindow)
+	if capability.ContextWindow != nil && *capability.ContextWindow < window {
+		window = *capability.ContextWindow
+	}
+
+	modalities := []string{"text", "image"}
+	if capability.InputModalities == store.ModelModalitiesText {
+		modalities = []string{"text"}
+	}
+
+	reasoningLevels := make([]codexReasoningLevel, 0, len(capability.ReasoningLevels))
+	for _, level := range capability.ReasoningLevels {
+		reasoningLevels = append(reasoningLevels, codexReasoningLevel{Effort: level, Description: level + " reasoning"})
+	}
 	defaultReasoningLevel := "none"
+	if len(reasoningLevels) == 0 {
+		reasoningLevels = []codexReasoningLevel{{Effort: "none", Description: "No reasoning"}}
+	} else {
+		defaultReasoningLevel = reasoningLevels[0].Effort
+		for _, level := range reasoningLevels {
+			if level.Effort == "none" {
+				defaultReasoningLevel = "none"
+				break
+			}
+		}
+	}
 
 	return codexModelInfo{
-		Slug:        slug,
-		DisplayName: slug,
-		Description: "Model routed through the AI gateway.",
-		SupportedReasoningLevels: []codexReasoningLevel{
-			{Effort: "none", Description: "No reasoning"},
-		},
+		Slug:                      slug,
+		DisplayName:               slug,
+		Description:               "Model routed through the AI gateway.",
+		SupportedReasoningLevels:  reasoningLevels,
 		DefaultReasoningLevel:     &defaultReasoningLevel,
 		MultiAgentReasoningEffort: nil,
 		ShellType:                 "unified_exec",
@@ -218,7 +243,7 @@ func newCodexModelInfo(slug string, contextWindow int) codexModelInfo {
 		CompHash:                      nil,
 		EffectiveContextWindowPercent: codexWindowPercent,
 		ExperimentalSupportedTools:    []string{},
-		InputModalities:               []string{"text", "image"},
+		InputModalities:               modalities,
 		SupportsSearchTool:            false,
 		UseResponsesLite:              false,
 		NodeREPLAutoReviewRequired:    false,

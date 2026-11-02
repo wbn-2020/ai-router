@@ -76,6 +76,10 @@ type RequestInfo struct {
 	Protocol string
 	Endpoint Endpoint
 	Model    string
+	// PinnedChannelID 非零表示有状态请求只能发往该渠道，且不跨渠道重试。
+	PinnedChannelID int64
+	// Stateful 表示请求依赖上游会话状态，失败时应归为请求范围而非渠道故障。
+	Stateful bool
 }
 
 type requestInfoContextKey struct{}
@@ -213,8 +217,8 @@ func (h *Handler) serveData(
 		writeModelNotAvailable(w)
 		return
 	}
-	if h.forwarder == nil {
-		writeUnavailable(w)
+	if requestHasImage(body) && effectiveInputModalities(candidates) == store.ModelModalitiesText {
+		writeInputUnsupported(w)
 		return
 	}
 
@@ -223,6 +227,26 @@ func (h *Handler) serveData(
 		Endpoint: endpoint,
 		Model:    model,
 	}
+	if protocol == ProtocolOpenAIResponses {
+		stateful := parseStatefulRequest(body)
+		if stateful.wantsBackground() {
+			writeUnsupportedParameter(w)
+			return
+		}
+		if stateful.isStateful() {
+			if len(candidates) != 1 {
+				writeStatefulRouteUnavailable(w)
+				return
+			}
+			info.PinnedChannelID = candidates[0].ChannelID
+			info.Stateful = true
+		}
+	}
+	if h.forwarder == nil {
+		writeUnavailable(w)
+		return
+	}
+
 	ctx = context.WithValue(ctx, requestInfoContextKey{}, info)
 	h.forwarder.ServeHTTP(w, r.WithContext(ctx))
 }

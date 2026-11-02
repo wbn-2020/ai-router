@@ -40,32 +40,44 @@ func (a *API) registerModelRouteRoutes() {
 //
 // priority 省略为 0，enabled 省略为 true。
 type createModelRouteRequest struct {
-	ClientModel   string `json:"client_model"`
-	ChannelID     int64  `json:"channel_id"`
-	UpstreamModel string `json:"upstream_model"`
-	Priority      *int   `json:"priority"`
-	Enabled       *bool  `json:"enabled"`
+	ClientModel     string   `json:"client_model"`
+	ChannelID       int64    `json:"channel_id"`
+	UpstreamModel   string   `json:"upstream_model"`
+	Priority        *int     `json:"priority"`
+	Enabled         *bool    `json:"enabled"`
+	InputModalities string   `json:"input_modalities"`
+	ContextWindow   *int64   `json:"context_window"`
+	ReasoningLevels []string `json:"reasoning_levels"`
 }
 
 // updateModelRouteRequest 是更新映射的请求体；省略字段保持原值。
+//
+// input_modalities/context_window/reasoning_levels 用指针区分“省略”与
+// “显式清空”：context_window=0 与 reasoning_levels=[] 都是清空声明。
 type updateModelRouteRequest struct {
-	ClientModel   *string `json:"client_model"`
-	ChannelID     *int64  `json:"channel_id"`
-	UpstreamModel *string `json:"upstream_model"`
-	Priority      *int    `json:"priority"`
-	Enabled       *bool   `json:"enabled"`
+	ClientModel     *string   `json:"client_model"`
+	ChannelID       *int64    `json:"channel_id"`
+	UpstreamModel   *string   `json:"upstream_model"`
+	Priority        *int      `json:"priority"`
+	Enabled         *bool     `json:"enabled"`
+	InputModalities *string   `json:"input_modalities"`
+	ContextWindow   *int64    `json:"context_window"`
+	ReasoningLevels *[]string `json:"reasoning_levels"`
 }
 
 // modelRouteView 是管理端可见的映射视图；不包含任何上游凭据。
 type modelRouteView struct {
-	ID            int64     `json:"id"`
-	ClientModel   string    `json:"client_model"`
-	ChannelID     int64     `json:"channel_id"`
-	UpstreamModel string    `json:"upstream_model"`
-	Priority      int       `json:"priority"`
-	Enabled       bool      `json:"enabled"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	ID              int64     `json:"id"`
+	ClientModel     string    `json:"client_model"`
+	ChannelID       int64     `json:"channel_id"`
+	UpstreamModel   string    `json:"upstream_model"`
+	Priority        int       `json:"priority"`
+	Enabled         bool      `json:"enabled"`
+	InputModalities string    `json:"input_modalities"`
+	ContextWindow   *int64    `json:"context_window"`
+	ReasoningLevels []string  `json:"reasoning_levels"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 type modelRouteListResponse struct {
@@ -78,15 +90,22 @@ type modelsResponse struct {
 }
 
 func newModelRouteView(route store.ModelRoute) modelRouteView {
+	levels := route.ReasoningLevels
+	if levels == nil {
+		levels = []string{}
+	}
 	return modelRouteView{
-		ID:            route.ID,
-		ClientModel:   route.ClientModel,
-		ChannelID:     route.ChannelID,
-		UpstreamModel: route.UpstreamModel,
-		Priority:      route.Priority,
-		Enabled:       route.Enabled,
-		CreatedAt:     route.CreatedAt.UTC(),
-		UpdatedAt:     route.UpdatedAt.UTC(),
+		ID:              route.ID,
+		ClientModel:     route.ClientModel,
+		ChannelID:       route.ChannelID,
+		UpstreamModel:   route.UpstreamModel,
+		Priority:        route.Priority,
+		Enabled:         route.Enabled,
+		InputModalities: route.InputModalities,
+		ContextWindow:   route.ContextWindow,
+		ReasoningLevels: levels,
+		CreatedAt:       route.CreatedAt.UTC(),
+		UpdatedAt:       route.UpdatedAt.UTC(),
 	}
 }
 
@@ -145,11 +164,14 @@ func (a *API) handleCreateModelRoute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	route, err := repo.Create(r.Context(), store.ModelRouteInput{
-		ClientModel:   req.ClientModel,
-		ChannelID:     req.ChannelID,
-		UpstreamModel: req.UpstreamModel,
-		Priority:      priority,
-		Enabled:       enabled,
+		ClientModel:     req.ClientModel,
+		ChannelID:       req.ChannelID,
+		UpstreamModel:   req.UpstreamModel,
+		Priority:        priority,
+		Enabled:         enabled,
+		InputModalities: req.InputModalities,
+		ContextWindow:   contextWindowValue(req.ContextWindow),
+		ReasoningLevels: req.ReasoningLevels,
 	})
 	if err != nil {
 		a.writeModelRouteError(w, err)
@@ -180,11 +202,14 @@ func (a *API) handleUpdateModelRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	input := store.ModelRouteInput{
-		ClientModel:   existing.ClientModel,
-		ChannelID:     existing.ChannelID,
-		UpstreamModel: existing.UpstreamModel,
-		Priority:      existing.Priority,
-		Enabled:       existing.Enabled,
+		ClientModel:     existing.ClientModel,
+		ChannelID:       existing.ChannelID,
+		UpstreamModel:   existing.UpstreamModel,
+		Priority:        existing.Priority,
+		Enabled:         existing.Enabled,
+		InputModalities: existing.InputModalities,
+		ContextWindow:   contextWindowValue(existing.ContextWindow),
+		ReasoningLevels: existing.ReasoningLevels,
 	}
 	if req.ClientModel != nil {
 		input.ClientModel = *req.ClientModel
@@ -201,6 +226,15 @@ func (a *API) handleUpdateModelRoute(w http.ResponseWriter, r *http.Request) {
 	if req.Enabled != nil {
 		input.Enabled = *req.Enabled
 	}
+	if req.InputModalities != nil {
+		input.InputModalities = *req.InputModalities
+	}
+	if req.ContextWindow != nil {
+		input.ContextWindow = *req.ContextWindow
+	}
+	if req.ReasoningLevels != nil {
+		input.ReasoningLevels = *req.ReasoningLevels
+	}
 
 	route, err := repo.Update(r.Context(), id, input)
 	if err != nil {
@@ -208,6 +242,13 @@ func (a *API) handleUpdateModelRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, newModelRouteView(route))
+}
+
+func contextWindowValue(window *int64) int64 {
+	if window == nil {
+		return 0
+	}
+	return *window
 }
 
 func (a *API) handleDeleteModelRoute(w http.ResponseWriter, r *http.Request) {

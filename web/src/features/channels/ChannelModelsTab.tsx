@@ -1,7 +1,24 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 
 import { ApiError, isUnauthorizedError } from '../../lib/api';
-import { mappingsApi, type ModelRoute } from '../mappings/api';
+import {
+  CONTEXT_WINDOW_MAX,
+  CONTEXT_WINDOW_MIN,
+  MODALITY_OPTIONS,
+  REASONING_LEVELS,
+  normalizeRouteCapability,
+  orderReasoningLevels,
+  parseContextWindowInput,
+  sameReasoningLevels,
+} from '../mappings/capability';
+import {
+  mappingsApi,
+  type InputModalities,
+  type ModelRoute,
+  type ModelRouteInput,
+  type ModelRoutePatch,
+  type ReasoningLevel,
+} from '../mappings/api';
 import { channelsApi } from './api';
 import { ChannelModelPicker } from './ChannelModelPicker';
 import { ChannelTestResultView, checkStatusLabel } from './ChannelTestResultView';
@@ -34,6 +51,161 @@ function describeRouteError(error: unknown, fallback: string): string {
   return `${fallback}，请检查网络连接后重试。`;
 }
 
+const CONTEXT_WINDOW_ERROR = `上下文窗口必须是 ${CONTEXT_WINDOW_MIN} 到 ${CONTEXT_WINDOW_MAX} 的整数，或留空表示未声明。`;
+
+type CapabilityInput = Pick<
+  ModelRouteInput,
+  'input_modalities' | 'context_window' | 'reasoning_levels'
+>;
+
+/** declaredCapabilityFields 只把已声明的能力放进创建请求；留空即不传。 */
+function declaredCapabilityFields(
+  modalities: InputModalities,
+  contextWindow: number | null,
+  levels: ReasoningLevel[],
+): CapabilityInput {
+  const fields: CapabilityInput = {};
+  if (modalities !== 'unknown') {
+    fields.input_modalities = modalities;
+  }
+  if (contextWindow !== null) {
+    fields.context_window = contextWindow;
+  }
+  if (levels.length > 0) {
+    fields.reasoning_levels = levels;
+  }
+  return fields;
+}
+
+function toggleReasoningLevel(
+  levels: ReasoningLevel[],
+  level: ReasoningLevel,
+  checked: boolean,
+): ReasoningLevel[] {
+  return orderReasoningLevels(
+    checked ? [...levels, level] : levels.filter((item) => item !== level),
+  );
+}
+
+interface CapabilityFieldsProps {
+  idPrefix: string;
+  modalities: InputModalities;
+  contextWindow: string;
+  levels: ReasoningLevel[];
+  disabled: boolean;
+  windowError: string | null;
+  onModalitiesChange: (value: InputModalities) => void;
+  onContextWindowChange: (value: string) => void;
+  onLevelsChange: (levels: ReasoningLevel[]) => void;
+}
+
+/**
+ * CapabilityFields 是创建/编辑共用的能力声明输入。
+ *
+ * 三项都允许“未声明”：留空或全部不勾选即表示未声明，不推断默认值。
+ */
+function CapabilityFields({
+  idPrefix,
+  modalities,
+  contextWindow,
+  levels,
+  disabled,
+  windowError,
+  onModalitiesChange,
+  onContextWindowChange,
+  onLevelsChange,
+}: CapabilityFieldsProps): ReactNode {
+  const modalitiesID = `${idPrefix}-modalities`;
+  const windowID = `${idPrefix}-window`;
+  const windowErrorID = `${idPrefix}-window-error`;
+  const windowNoteID = `${idPrefix}-window-note`;
+  return (
+    <>
+      <div className="channel-models__manual">
+        <div className="field">
+          <label htmlFor={modalitiesID}>输入模态</label>
+          <select
+            id={modalitiesID}
+            className="input"
+            value={modalities}
+            disabled={disabled}
+            onChange={(event) => onModalitiesChange(event.target.value as InputModalities)}
+          >
+            {MODALITY_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+          <p className="form-note">未声明不会被当作支持或拒绝图片。</p>
+        </div>
+        <div className="field">
+          <label htmlFor={windowID}>上下文窗口</label>
+          <input
+            id={windowID}
+            className="input"
+            type="number"
+            min={CONTEXT_WINDOW_MIN}
+            max={CONTEXT_WINDOW_MAX}
+            step={1}
+            inputMode="numeric"
+            placeholder="留空表示未声明"
+            value={contextWindow}
+            disabled={disabled}
+            aria-invalid={windowError !== null}
+            aria-describedby={windowError === null ? windowNoteID : windowErrorID}
+            onChange={(event) => onContextWindowChange(event.target.value)}
+          />
+          {windowError === null ? (
+            <p className="form-note" id={windowNoteID}>
+              范围 {CONTEXT_WINDOW_MIN} 到 {CONTEXT_WINDOW_MAX}；留空表示未声明。
+            </p>
+          ) : (
+            <p className="form-error" id={windowErrorID}>
+              {windowError}
+            </p>
+          )}
+        </div>
+      </div>
+      <fieldset style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
+        <legend
+          style={{
+            marginBottom: 8,
+            padding: 0,
+            fontSize: 13,
+            fontWeight: 600,
+            color: 'var(--color-text-soft)',
+          }}
+        >
+          推理档位
+        </legend>
+        <div className="toolbar">
+          {REASONING_LEVELS.map((level) => {
+            const id = `${idPrefix}-level-${level}`;
+            return (
+              <label className="checkbox-row" key={level} htmlFor={id}>
+                <input
+                  id={id}
+                  type="checkbox"
+                  checked={levels.includes(level)}
+                  disabled={disabled}
+                  onChange={(event) =>
+                    onLevelsChange(toggleReasoningLevel(levels, level, event.target.checked))
+                  }
+                />
+                {level}
+              </label>
+            );
+          })}
+        </div>
+        <p className="form-note" style={{ marginTop: 8 }}>
+          不勾选任何档位表示未声明。
+        </p>
+      </fieldset>
+    </>
+  );
+}
+
 type ModelCheck = { generation: number } & (
   | { result: ChannelTestResult; error?: never }
   | { error: string; result?: never }
@@ -62,11 +234,21 @@ export function ChannelModelsTab({
   const [syncBusy, setSyncBusy] = useState(false);
   const [manualClient, setManualClient] = useState('');
   const [manualUpstream, setManualUpstream] = useState('');
+  const [manualAdvancedOpen, setManualAdvancedOpen] = useState(false);
+  const [manualModalities, setManualModalities] = useState<InputModalities>('unknown');
+  const [manualWindow, setManualWindow] = useState('');
+  const [manualWindowError, setManualWindowError] = useState<string | null>(null);
+  const [manualLevels, setManualLevels] = useState<ReasoningLevel[]>([]);
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<ModelRoute | null>(null);
   const [editClient, setEditClient] = useState('');
   const [editUpstream, setEditUpstream] = useState('');
   const [editPriority, setEditPriority] = useState('0');
+  const [editAdvancedOpen, setEditAdvancedOpen] = useState(false);
+  const [editModalities, setEditModalities] = useState<InputModalities>('unknown');
+  const [editWindow, setEditWindow] = useState('');
+  const [editLevels, setEditLevels] = useState<ReasoningLevel[]>([]);
+  const [editWindowError, setEditWindowError] = useState<string | null>(null);
   const [testingID, setTestingID] = useState<number | null>(null);
   const [checks, setChecks] = useState<Record<number, ModelCheck>>({});
   const pendingRef = useRef({ operation: false, fetching: false });
@@ -234,6 +416,13 @@ export function ChannelModelsTab({
       setActionError('请输入客户端模型名。');
       return;
     }
+    const parsedWindow = parseContextWindowInput(manualWindow);
+    if (!parsedWindow.ok) {
+      setManualWindowError(CONTEXT_WINDOW_ERROR);
+      setManualAdvancedOpen(true);
+      return;
+    }
+    setManualWindowError(null);
     if (!beginOperation()) {
       return;
     }
@@ -247,10 +436,15 @@ export function ChannelModelsTab({
         upstream_model: upstream,
         priority: 0,
         enabled: true,
+        ...declaredCapabilityFields(manualModalities, parsedWindow.value, manualLevels),
       });
       setRoutes((current) => [...(current ?? []), created]);
       setManualClient('');
       setManualUpstream('');
+      setManualModalities('unknown');
+      setManualWindow('');
+      setManualWindowError(null);
+      setManualLevels([]);
       setNotice(`已添加模型「${created.client_model}」。`);
     } catch (error) {
       if (isUnauthorizedError(error)) {
@@ -265,10 +459,15 @@ export function ChannelModelsTab({
   };
 
   const startEdit = (route: ModelRoute) => {
+    const capability = normalizeRouteCapability(route);
     setEditing(route);
     setEditClient(route.client_model);
     setEditUpstream(route.upstream_model);
     setEditPriority(String(route.priority));
+    setEditModalities(capability.modalities);
+    setEditWindow(capability.window === null ? '' : String(capability.window));
+    setEditLevels(capability.levels);
+    setEditWindowError(null);
     setActionError(null);
     setNotice(null);
   };
@@ -289,18 +488,40 @@ export function ChannelModelsTab({
       setActionError(`优先级必须是 ${PRIORITY_MIN} 到 ${PRIORITY_MAX} 的整数。`);
       return;
     }
+    const parsedWindow = parseContextWindowInput(editWindow);
+    if (!parsedWindow.ok) {
+      setEditWindowError(CONTEXT_WINDOW_ERROR);
+      setEditAdvancedOpen(true);
+      return;
+    }
+    setEditWindowError(null);
     if (!beginOperation()) {
       return;
     }
+
+    // 只提交与当前值不同的能力字段：省略即保持，0 / [] 才是显式清空。
+    const current = normalizeRouteCapability(editing);
+    const nextLevels = orderReasoningLevels(editLevels);
+    const patch: ModelRoutePatch = {
+      client_model: client,
+      upstream_model: upstream,
+      priority,
+    };
+    if (editModalities !== current.modalities) {
+      patch.input_modalities = editModalities;
+    }
+    if (parsedWindow.value !== current.window) {
+      patch.context_window = parsedWindow.value === null ? 0 : parsedWindow.value;
+    }
+    if (!sameReasoningLevels(nextLevels, current.levels)) {
+      patch.reasoning_levels = nextLevels;
+    }
+
     setBusyID(editing.id);
     setActionError(null);
     try {
-      const updated = await mappingsApi.updateRoute(editing.id, {
-        client_model: client,
-        upstream_model: upstream,
-        priority,
-      });
-      setRoutes((current) => (current ?? []).map((item) => item.id === updated.id ? updated : item));
+      const updated = await mappingsApi.updateRoute(editing.id, patch);
+      setRoutes((currentRoutes) => (currentRoutes ?? []).map((item) => item.id === updated.id ? updated : item));
       clearCheck(editing.id);
       setEditing(null);
       setNotice('模型映射已更新。');
@@ -390,20 +611,47 @@ export function ChannelModelsTab({
       {actionError === null ? null : <p className="form-error" role="alert">{actionError}</p>}
       {notice === null ? null : <p className="form-note" role="status">{notice}</p>}
 
-      <form className="channel-models__manual" aria-label="手动添加模型映射" onSubmit={(event) => void handleManualAdd(event)}>
-        <div className="field">
-          <label htmlFor="manual-client-model">客户端模型</label>
-          <input id="manual-client-model" className="input" value={manualClient} disabled={blocked} placeholder="例如 gpt-5" onChange={(event) => setManualClient(event.target.value)} />
+      <form aria-label="手动添加模型映射" noValidate onSubmit={(event) => void handleManualAdd(event)}>
+        <div className="channel-models__manual">
+          <div className="field">
+            <label htmlFor="manual-client-model">客户端模型</label>
+            <input id="manual-client-model" className="input" value={manualClient} disabled={blocked} placeholder="例如 gpt-5" onChange={(event) => setManualClient(event.target.value)} />
+          </div>
+          <div className="field">
+            <label htmlFor="manual-upstream-model">上游模型（留空同名）</label>
+            <input id="manual-upstream-model" className="input" value={manualUpstream} disabled={blocked} placeholder="默认与客户端模型相同" onChange={(event) => setManualUpstream(event.target.value)} />
+          </div>
+          <button type="submit" className="button button--ghost" disabled={blocked}>{adding ? '正在添加…' : '手动添加'}</button>
         </div>
-        <div className="field">
-          <label htmlFor="manual-upstream-model">上游模型（留空同名）</label>
-          <input id="manual-upstream-model" className="input" value={manualUpstream} disabled={blocked} placeholder="默认与客户端模型相同" onChange={(event) => setManualUpstream(event.target.value)} />
-        </div>
-        <button type="submit" className="button button--ghost" disabled={blocked}>{adding ? '正在添加…' : '手动添加'}</button>
+        <details
+          className="advanced"
+          style={{ marginTop: 10 }}
+          open={manualAdvancedOpen}
+          onToggle={(event) => setManualAdvancedOpen(event.currentTarget.open)}
+        >
+          <summary>能力声明（可选）</summary>
+          <div className="advanced__body">
+            <CapabilityFields
+              idPrefix="manual"
+              modalities={manualModalities}
+              contextWindow={manualWindow}
+              levels={manualLevels}
+              disabled={blocked}
+              windowError={manualWindowError}
+              onModalitiesChange={setManualModalities}
+              onContextWindowChange={(value) => {
+                setManualWindow(value);
+                setManualWindowError(null);
+              }}
+              onLevelsChange={setManualLevels}
+            />
+            <p className="form-note">创建时留空的能力不会提交，保持未声明；保存后仍可在编辑表单中补充。</p>
+          </div>
+        </details>
       </form>
 
       {editing === null ? null : (
-        <form className="subpanel" aria-label="编辑模型映射" onSubmit={(event) => void handleEditSave(event)}>
+        <form className="subpanel" aria-label="编辑模型映射" noValidate onSubmit={(event) => void handleEditSave(event)}>
           <h3>编辑模型映射</h3>
           <div className="channel-models__manual">
             <div className="field">
@@ -419,6 +667,31 @@ export function ChannelModelsTab({
               <input id="edit-priority" className="input" type="number" min={PRIORITY_MIN} max={PRIORITY_MAX} value={editPriority} disabled={blocked} onChange={(event) => setEditPriority(event.target.value)} />
             </div>
           </div>
+          <details
+            className="advanced"
+            style={{ marginTop: 10 }}
+            open={editAdvancedOpen}
+            onToggle={(event) => setEditAdvancedOpen(event.currentTarget.open)}
+          >
+            <summary>能力声明（可选）</summary>
+            <div className="advanced__body">
+              <CapabilityFields
+                idPrefix="edit"
+                modalities={editModalities}
+                contextWindow={editWindow}
+                levels={editLevels}
+                disabled={blocked}
+                windowError={editWindowError}
+                onModalitiesChange={setEditModalities}
+                onContextWindowChange={(value) => {
+                  setEditWindow(value);
+                  setEditWindowError(null);
+                }}
+                onLevelsChange={setEditLevels}
+              />
+              <p className="form-note">只提交本次改动的能力项；未修改的项保持原值，留空或未勾选表示未声明。</p>
+            </div>
+          </details>
           <div className="toolbar">
             <button type="submit" className="button" disabled={blocked}>{busyID === editing.id ? '正在保存…' : '保存模型映射'}</button>
             <button type="button" className="button button--ghost" disabled={blocked} onClick={() => setEditing(null)}>取消</button>

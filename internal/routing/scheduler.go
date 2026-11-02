@@ -393,6 +393,68 @@ func (s *Scheduler) AcquireExcluding(
 	}
 }
 
+// AcquirePinned 为有状态请求取得指定渠道的槽位，不跨渠道回退。
+//
+// 只在该渠道仍是启用、协议匹配、连接版本未变且有空闲槽位时成功；
+// 熔断打开返回 ErrAllCircuitsOpen，满载返回 ErrChannelCapacity。
+func (s *Scheduler) AcquirePinned(
+	ctx context.Context,
+	channelID int64,
+	clientModel, protocol string,
+) (Candidate, *Slot, error) {
+	if s == nil || s.limiter == nil {
+		return Candidate{}, nil, errors.New("routing: 调度器未初始化")
+	}
+	if err := ctx.Err(); err != nil {
+		return Candidate{}, nil, err
+	}
+	candidates, err := s.candidates(ctx, clientModel, strings.TrimSpace(protocol), false)
+	if err != nil {
+		return Candidate{}, nil, err
+	}
+	var candidate *Candidate
+	for i := range candidates {
+		if candidates[i].Channel.ID == channelID {
+			candidate = &candidates[i]
+			break
+		}
+	}
+	if candidate == nil {
+		return Candidate{}, nil, ErrNoCandidates
+	}
+	if !s.breaker.allow(*candidate) {
+		return Candidate{}, nil, ErrAllCircuitsOpen
+	}
+	slot, acquired := s.limiter.TryAcquire(candidate.Channel.ID, candidate.Channel.MaxConcurrency)
+	if !acquired {
+		return Candidate{}, nil, ErrChannelCapacity
+	}
+	fresh, getErr := s.channels.Get(ctx, candidate.Channel.ID)
+	if getErr != nil || !fresh.Enabled || fresh.Protocol != strings.TrimSpace(protocol) ||
+		fresh.ConnectionRevision != candidate.Channel.ConnectionRevision ||
+		!s.limiter.confirmLimit(fresh.ID, fresh.MaxConcurrency) {
+		slot.Release()
+		if getErr != nil && !errors.Is(getErr, store.ErrChannelNotFound) {
+			return Candidate{}, nil, fmt.Errorf("routing: 复查渠道失败：%w", getErr)
+		}
+		return Candidate{}, nil, ErrNoCandidates
+	}
+	candidate.Channel = fresh
+	ticket := s.breaker.acquire(*candidate)
+	if ticket == nil {
+		slot.Release()
+		return Candidate{}, nil, ErrAllCircuitsOpen
+	}
+	candidate.ticket = ticket
+	slot.onRelease = func() { s.breaker.cancel(ticket) }
+	if err := ctx.Err(); err != nil {
+		slot.Release()
+		return Candidate{}, nil, err
+	}
+	s.touchLastUsed(ctx, candidate.Channel.ID)
+	return *candidate, slot, nil
+}
+
 // RecordSuccess 只接受本次派发的票据；必须在 slot.Release 前调用。
 func (s *Scheduler) RecordSuccess(candidate Candidate) {
 	if s.validFeedback(candidate) {

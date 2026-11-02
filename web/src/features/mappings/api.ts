@@ -10,7 +10,22 @@
 
 import { apiRequest } from '../../lib/api';
 
-/** ModelRoute 是 /admin/api/model-routes 返回的映射视图。 */
+/**
+ * InputModalities 是逐路由的输入模态声明。
+ *
+ * unknown 表示未声明，不容错为“不支持图片”或“支持图片”，由服务端与调用方
+ * 决定降级策略；与 internal/store/capabilities.go 的枚举一致。
+ */
+export type InputModalities = 'unknown' | 'text' | 'text_image';
+
+/** ReasoningLevel 与 internal/store/capabilities.go 的档位顺序一致。 */
+export type ReasoningLevel = 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+
+/**
+ * ModelRoute 是 /admin/api/model-routes 返回的映射视图。
+ *
+ * 能力字段保持可选：旧响应（或测试 fixture）没有这些键时按“未声明”展示。
+ */
 export interface ModelRoute {
   id: number;
   client_model: string;
@@ -18,6 +33,9 @@ export interface ModelRoute {
   upstream_model: string;
   priority: number;
   enabled: boolean;
+  input_modalities?: InputModalities;
+  context_window?: number | null;
+  reasoning_levels?: ReasoningLevel[] | null;
   created_at: string;
   updated_at: string;
 }
@@ -48,16 +66,28 @@ export interface ChannelListResponse {
   channels: ChannelSummary[];
 }
 
-/** ModelRouteInput 是创建映射与服务端全量更新共用的请求体。 */
+/**
+ * ModelRouteInput 是创建映射与服务端全量更新共用的请求体。
+ *
+ * 能力字段可选：创建时省略等于未声明（服务端默认 unknown/空窗口/空档位）。
+ */
 export interface ModelRouteInput {
   client_model: string;
   channel_id: number;
   upstream_model: string;
   priority: number;
   enabled: boolean;
+  input_modalities?: InputModalities;
+  context_window?: number | null;
+  reasoning_levels?: ReasoningLevel[];
 }
 
-/** ModelRoutePatch 是 PATCH /admin/api/model-routes/{id} 的部分更新。 */
+/**
+ * ModelRoutePatch 是 PATCH /admin/api/model-routes/{id} 的部分更新。
+ *
+ * 省略能力字段等于保持原值；显式清空用 context_window: 0 与 reasoning_levels: []，
+ * 模态清空用 input_modalities: 'unknown'。
+ */
 export type ModelRoutePatch = Partial<ModelRouteInput>;
 
 export const mappingsApi = {

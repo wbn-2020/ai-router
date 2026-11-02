@@ -45,7 +45,7 @@ type codexModelPlaceholder struct {
 
 // codexManifestBuilder 允许 T26 在 router.go 组装 Handler 时注入完整 manifest
 // 构造器，而不需要修改本文件的普通模型列表逻辑。
-type codexManifestBuilder func(models []string) any
+type codexManifestBuilder func(models []ModelCapabilities) any
 
 // serveModels 处理 GET /v1/models。
 //
@@ -122,7 +122,7 @@ func (h *Handler) serveModel(w http.ResponseWriter, r *http.Request) {
 // Codex 只使用原生 Responses 渠道；即使同一客户端模型还映射到 Chat 渠道，
 // 也不能出现在这里，否则客户端会选中一个数据面无法用该协议服务的模型。
 func (h *Handler) writeCodexManifest(w http.ResponseWriter, r *http.Request) {
-	models, ok := h.listModelsForProtocol(w, r, store.ChannelProtocolOpenAIResponses)
+	entries, ok := h.codexCapabilities(w, r)
 	if !ok {
 		return
 	}
@@ -130,7 +130,38 @@ func (h *Handler) writeCodexManifest(w http.ResponseWriter, r *http.Request) {
 	if builder == nil {
 		builder = buildCodexManifestPlaceholder
 	}
-	writeJSON(w, http.StatusOK, builder(models))
+	writeJSON(w, http.StatusOK, builder(entries))
+}
+
+// codexCapabilities 按协议读取候选并按别名聚合共同能力。
+//
+// 旧 RouteCatalog 实现没有 ListByProtocol 时回退到模型名列表，能力按
+// 未声明处理；生产仓储总是提供前者。
+func (h *Handler) codexCapabilities(w http.ResponseWriter, r *http.Request) ([]ModelCapabilities, bool) {
+	if h.routes == nil {
+		writeUnavailable(w)
+		return nil, false
+	}
+	if catalog, ok := h.routes.(interface {
+		ListByProtocol(context.Context, string) ([]store.ModelRoute, error)
+	}); ok {
+		routes, err := catalog.ListByProtocol(r.Context(), store.ChannelProtocolOpenAIResponses)
+		if err != nil {
+			writeInternalError(w)
+			return nil, false
+		}
+		return capabilitiesByAlias(routes), true
+	}
+
+	models, ok := h.listModelsForProtocol(w, r, store.ChannelProtocolOpenAIResponses)
+	if !ok {
+		return nil, false
+	}
+	entries := make([]ModelCapabilities, 0, len(models))
+	for _, model := range models {
+		entries = append(entries, ModelCapabilities{Slug: model, InputModalities: store.ModelModalitiesUnknown})
+	}
+	return entries, true
 }
 
 // listModelsForProtocol 优先按入站协议过滤模型；旧 RouteCatalog 实现没有
@@ -196,12 +227,12 @@ func newModelCard(model string) modelCard {
 	}
 }
 
-func buildCodexManifestPlaceholder(models []string) any {
+func buildCodexManifestPlaceholder(models []ModelCapabilities) any {
 	entries := make([]codexModelPlaceholder, 0, len(models))
 	for _, model := range models {
 		entries = append(entries, codexModelPlaceholder{
-			Slug:        model,
-			DisplayName: model,
+			Slug:        model.Slug,
+			DisplayName: model.Slug,
 		})
 	}
 	return codexManifestPlaceholder{Models: entries}

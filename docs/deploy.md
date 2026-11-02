@@ -94,7 +94,17 @@ export GATEWAY_ADMIN_PASSWORD='至少 12 个字符的初始密码'
 
 总预算从进入转发编排开始计算，不包含入站请求体上传。上游子超时与总预算同时生效，以先到者为准；客户端更短的截止也优先。成功响应及已提交流的写截止不超过总预算。尚未提交时，预算耗尽后的固定错误JSON最多使用额外 `min(1s, GATEWAY_DOWNSTREAM_WRITE_TIMEOUT)` 写窗口，不再启动上游尝试；已提交流不能改成HTTP 504或无缝切换。检查结果落库另有最多1秒的记录预算，不延长检查请求。请求完成后的日志持久化有独立有限收尾时间。
 
-### 3.1 渠道运行状态与检查
+### 3.2 模型能力与有状态请求
+
+- 每条模型映射可以声明 `input_modalities`（unknown/text/text_image）、`context_window` 与 `reasoning_levels`（none/low/medium/high/xhigh/max/ultra）。未声明表示“未知”，不是“不支持”。
+- Codex manifest 与图片准入使用同一别名全部同协议候选的**共同能力**：任一候选显式 `text` 时别名收窄为纯文本并拒绝图片；窗口取已声明候选的最小值（不超过全局配置）；推理档位取交集，未声明或交集为空回退 `none`。
+- 未声明模态默认按 `text+image`（保持图片能力，管理端需醒目标注“未声明”）；如果确认某上游只支持文本，请显式声明 `text`。
+- `background=true` 一律返回 400 `unsupported_parameter`：网关没有后台响应生命周期端点。
+- `previous_response_id`、`conversation`、`reasoning.encrypted_content`、`item_reference` 视为有状态请求：仅当该别名恰有 1 条启用同协议候选时放行并钉住该渠道、禁止跨渠道重试；多候选返回 400 `stateful_route_unavailable`。
+- `GET/DELETE/cancel /v1/responses/{id}` 与 Conversations API 仍未实现（404）；conversation id 只能在网关之外创建。
+- 有状态请求的上游失败按请求范围记录，不写渠道熔断。
+
+### 3.3 渠道运行状态与检查
 
 - **启用状态**控制是否参与调度；**运行状态**来自当前进程的并发与熔断快照；**最近检查**是管理员显式触发的指定模型/协议生成检查。三者不互相替代。
 - 冷却结束但尚未成功恢复时显示待恢复/恢复中。仅一个生产请求可取得恢复许可，不自动发起付费后台探针；进程重启会清空运行态。

@@ -34,7 +34,37 @@ const (
 	errorCodeBodyTooLarge      = "request_body_too_large"
 	errorCodeInternal          = "internal_error"
 	errorCodeUnavailable       = "gateway_unavailable"
+	errorCodeInputUnsupported  = "model_input_unsupported"
+	errorCodeStatefulRoute     = "stateful_route_unavailable"
+	errorCodeUnsupportedParam  = "unsupported_parameter"
 )
+
+// writeInputUnsupported 拒绝把图片发往已声明为纯文本的别名。
+func writeInputUnsupported(w http.ResponseWriter) {
+	writeAPIError(w, http.StatusBadRequest, APIError{
+		Message: "This model does not accept image input.",
+		Type:    errorTypeInvalidRequest,
+		Code:    errorCodeInputUnsupported,
+	})
+}
+
+// writeStatefulRouteUnavailable 表示有状态请求没有唯一可钉住的渠道。
+func writeStatefulRouteUnavailable(w http.ResponseWriter) {
+	writeAPIError(w, http.StatusBadRequest, APIError{
+		Message: "Stateful requests require exactly one upstream candidate for this model.",
+		Type:    errorTypeInvalidRequest,
+		Code:    errorCodeStatefulRoute,
+	})
+}
+
+// writeUnsupportedParameter 用于明确拒绝网关未实现的协议能力。
+func writeUnsupportedParameter(w http.ResponseWriter) {
+	writeAPIError(w, http.StatusBadRequest, APIError{
+		Message: "background responses are not supported by this gateway.",
+		Type:    errorTypeInvalidRequest,
+		Code:    errorCodeUnsupportedParam,
+	})
+}
 
 // writeAPIError 写出协议固定的错误 envelope 并禁用缓存。
 func writeAPIError(w http.ResponseWriter, status int, apiErr APIError) {
